@@ -1,0 +1,151 @@
+import os
+import folder_paths
+import torchaudio
+
+# Register audio file types with ComfyUI's path system
+audio_extensions = ["mp3", "wav", "flac", "ogg", "aac", "m4a", "opus"]
+
+# Add audio input directory to folder_paths
+if "audio" not in folder_paths.folder_names_and_paths:
+    folder_paths.folder_names_and_paths["audio"] = (
+        [os.path.join(folder_paths.base_path, "input")],
+        set(audio_extensions)
+    )
+
+
+class AudioLoaderNode:
+    """
+    A ComfyUI node for loading audio files with a rich waveform UI.
+    Outputs audio tensor, sample rate, duration, and metadata.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        audio_files = folder_paths.get_filename_list("audio")
+        return {
+            "required": {
+                "audio": (sorted(audio_files),),
+            },
+            "optional": {
+                "normalize": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO", "INT", "FLOAT", "STRING")
+    RETURN_NAMES = ("audio", "sample_rate", "duration_seconds", "metadata")
+    FUNCTION = "load_audio"
+    CATEGORY = "audio"
+    OUTPUT_NODE = False
+
+    def load_audio(self, audio, normalize=False):
+        audio_path = folder_paths.get_annotated_filepath(audio)
+
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # Load audio using torchaudio
+        waveform, sample_rate = torchaudio.load(audio_path)
+
+        # Normalize if requested
+        if normalize:
+            max_val = waveform.abs().max()
+            if max_val > 0:
+                waveform = waveform / max_val
+
+        # Calculate duration
+        duration_seconds = waveform.shape[-1] / sample_rate
+        num_channels = waveform.shape[0]
+        num_samples = waveform.shape[-1]
+
+        # Build metadata string
+        filename = os.path.basename(audio_path)
+        file_size = os.path.getsize(audio_path)
+        metadata = (
+            f"File: {filename} | "
+            f"Sample Rate: {sample_rate}Hz | "
+            f"Channels: {num_channels} | "
+            f"Samples: {num_samples} | "
+            f"Duration: {duration_seconds:.3f}s | "
+            f"Size: {file_size / 1024:.1f}KB"
+        )
+
+        # Package as AUDIO type dict (compatible with ComfyUI audio convention)
+        audio_data = {
+            "waveform": waveform.unsqueeze(0),  # Add batch dim: [B, C, T]
+            "sample_rate": sample_rate,
+        }
+
+        return (audio_data, sample_rate, duration_seconds, metadata)
+
+    @classmethod
+    def IS_CHANGED(cls, audio, normalize=False):
+        audio_path = folder_paths.get_annotated_filepath(audio)
+        if os.path.exists(audio_path):
+            return os.path.getmtime(audio_path)
+        return float("nan")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, audio, normalize=False):
+        if not folder_paths.exists_annotated_filepath(audio):
+            return f"Audio file does not exist: {audio}"
+        return True
+
+
+# Register upload endpoint for the drag-and-drop widget
+from server import PromptServer
+from aiohttp import web
+
+
+@PromptServer.instance.routes.post("/upload/audio")
+async def upload_audio(request):
+    """Handle audio file uploads from the frontend drag-and-drop widget."""
+    reader = await request.multipart()
+    field = await reader.next()
+
+    if not field or field.name != "image":  # ComfyUI uses "image" as field name for compatibility
+        return web.Response(status=400, text="No file field found")
+
+    filename = field.filename
+    if not filename:
+        return web.Response(status=400, text="No filename")
+
+    # Sanitize filename
+    filename = os.path.basename(filename)
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    if ext not in audio_extensions:
+        return web.Response(status=400, text=f"Unsupported audio format: {ext}")
+
+    # Determine save path
+    input_dir = folder_paths.get_input_directory()
+    save_path = os.path.join(input_dir, filename)
+
+    # Handle duplicates
+    base, extension = os.path.splitext(filename)
+    counter = 1
+    while os.path.exists(save_path):
+        new_filename = f"{base}_{counter}{extension}"
+        save_path = os.path.join(input_dir, new_filename)
+        filename = new_filename
+        counter += 1
+
+    # Write file
+    size = 0
+    with open(save_path, "wb") as f:
+        while chunk := await field.read_chunk(8192):
+            f.write(chunk)
+            size += len(chunk)
+
+    return web.json_response({
+        "name": filename,
+        "subfolder": "",
+        "type": "input"
+    })
+
+
+NODE_CLASS_MAPPINGS = {
+    "AudioLoader": AudioLoaderNode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "AudioLoader": "🎵 Audio Loader",
+}
