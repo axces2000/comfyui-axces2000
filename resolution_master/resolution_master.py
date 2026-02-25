@@ -17,19 +17,42 @@ RESOLUTIONS = {
 ORIENTATIONS     = ["landscape", "square", "portrait"]
 RESOLUTION_NAMES = list(RESOLUTIONS.keys())
 
+# All valid combined values — this is what the JS widget serializes
+# e.g. "2K (1080p)_landscape", "4K (2160p)_square", etc.
+COMBINED_VALUES = [
+    f"{res}_{orient}"
+    for res in RESOLUTION_NAMES
+    for orient in ORIENTATIONS
+]
+
+
+def parse_combined(value: str):
+    """Split 'RES_NAME_orientation' into (res_name, orientation).
+    The separator is the last underscore since res names never end with one."""
+    last = value.rfind("_")
+    if last == -1:
+        return "2K (1080p)", "landscape"
+    res    = value[:last]
+    orient = value[last + 1:]
+    if res not in RESOLUTIONS or orient not in ORIENTATIONS:
+        return "2K (1080p)", "landscape"
+    return res, orient
+
 
 class ResolutionMasterNode:
     """
     Outputs width and height integers for a chosen resolution and orientation.
-    Useful as a clean upstream input for any image generation node.
+    The single 'resolution' input carries both values as 'RES_landscape' etc.,
+    matched exactly to what the custom JS widget serializes.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "resolution":  (RESOLUTION_NAMES, {"default": "2K (1080p)"}),
-                "orientation": (ORIENTATIONS,     {"default": "landscape"}),
+                # One combined string input — the JS widget owns this entirely.
+                # We list all valid values so ComfyUI's validator is satisfied.
+                "resolution": (COMBINED_VALUES, {"default": "2K (1080p)_landscape"}),
             }
         }
 
@@ -39,13 +62,14 @@ class ResolutionMasterNode:
     CATEGORY      = "image/dimensions"
     OUTPUT_NODE   = False
 
-    def get_resolution(self, resolution, orientation):
-        w, h = RESOLUTIONS[resolution][orientation]
+    def get_resolution(self, resolution):
+        res, orient = parse_combined(resolution)
+        w, h = RESOLUTIONS[res][orient]
         return (w, h, f"{w}x{h}")
 
     @classmethod
-    def IS_CHANGED(cls, resolution, orientation):
-        return f"{resolution}_{orientation}"
+    def IS_CHANGED(cls, resolution):
+        return resolution
 
 
 NODE_CLASS_MAPPINGS = {
