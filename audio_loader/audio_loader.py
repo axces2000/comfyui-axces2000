@@ -1,6 +1,5 @@
 import os
 import folder_paths
-import torchaudio
 
 # Register audio file types with ComfyUI's path system
 audio_extensions = ["mp3", "wav", "flac", "ogg", "aac", "m4a", "opus"]
@@ -37,27 +36,82 @@ class AudioLoaderNode:
     CATEGORY = "audio"
     OUTPUT_NODE = False
 
+    def _load_waveform(self, audio_path: str):
+        """
+        Load audio with a robust multi-backend fallback.
+        Handles torchaudio >= 2.9 (torchcodec-based) and older versions.
+        Also works on Windows where torchcodec is unavailable.
+        """
+        last_error = None
+
+        # Strategy 1: torchcodec directly (torchaudio >= 2.9, Linux/Mac)
+        try:
+            from torchcodec.decoders import AudioDecoder
+            decoder = AudioDecoder(audio_path)
+            samples = decoder.get_all_samples()
+            waveform = samples.data
+            sample_rate = samples.sample_rate
+            return waveform, sample_rate
+        except Exception as e:
+            last_error = e
+
+        # Strategy 2: torchaudio with explicit soundfile backend
+        try:
+            import torchaudio
+            waveform, sample_rate = torchaudio.load(audio_path, backend="soundfile")
+            return waveform, sample_rate
+        except Exception as e:
+            last_error = e
+
+        # Strategy 3: torchaudio with ffmpeg backend
+        try:
+            import torchaudio
+            waveform, sample_rate = torchaudio.load(audio_path, backend="ffmpeg")
+            return waveform, sample_rate
+        except Exception as e:
+            last_error = e
+
+        # Strategy 4: plain torchaudio.load() — any version, any backend
+        try:
+            import torchaudio
+            waveform, sample_rate = torchaudio.load(audio_path)
+            return waveform, sample_rate
+        except Exception as e:
+            last_error = e
+
+        # Strategy 5: soundfile directly — tiny pure-Python fallback
+        try:
+            import soundfile as sf
+            import torch
+            data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+            waveform = torch.from_numpy(data.T)  # [channels, time]
+            return waveform, sample_rate
+        except Exception as e:
+            last_error = e
+
+        raise RuntimeError(
+            f"Could not load audio '{audio_path}' with any available backend. "
+            f"Last error: {last_error}\n"
+            f"Try: pip install torchcodec  OR  pip install soundfile"
+        )
+
     def load_audio(self, audio, normalize=False):
         audio_path = folder_paths.get_annotated_filepath(audio)
 
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        # Load audio using torchaudio
-        waveform, sample_rate = torchaudio.load(audio_path)
+        waveform, sample_rate = self._load_waveform(audio_path)
 
-        # Normalize if requested
         if normalize:
             max_val = waveform.abs().max()
             if max_val > 0:
                 waveform = waveform / max_val
 
-        # Calculate duration
         duration_seconds = waveform.shape[-1] / sample_rate
         num_channels = waveform.shape[0]
         num_samples = waveform.shape[-1]
 
-        # Build metadata string
         filename = os.path.basename(audio_path)
         file_size = os.path.getsize(audio_path)
         metadata = (
@@ -69,7 +123,6 @@ class AudioLoaderNode:
             f"Size: {file_size / 1024:.1f}KB"
         )
 
-        # Package as AUDIO type dict (compatible with ComfyUI audio convention)
         audio_data = {
             "waveform": waveform.unsqueeze(0),  # Add batch dim: [B, C, T]
             "sample_rate": sample_rate,
@@ -102,24 +155,21 @@ async def upload_audio(request):
     reader = await request.multipart()
     field = await reader.next()
 
-    if not field or field.name != "image":  # ComfyUI uses "image" as field name for compatibility
+    if not field or field.name != "image":
         return web.Response(status=400, text="No file field found")
 
     filename = field.filename
     if not filename:
         return web.Response(status=400, text="No filename")
 
-    # Sanitize filename
     filename = os.path.basename(filename)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
     if ext not in audio_extensions:
         return web.Response(status=400, text=f"Unsupported audio format: {ext}")
 
-    # Determine save path
     input_dir = folder_paths.get_input_directory()
     save_path = os.path.join(input_dir, filename)
 
-    # Handle duplicates
     base, extension = os.path.splitext(filename)
     counter = 1
     while os.path.exists(save_path):
@@ -128,12 +178,9 @@ async def upload_audio(request):
         filename = new_filename
         counter += 1
 
-    # Write file
-    size = 0
     with open(save_path, "wb") as f:
         while chunk := await field.read_chunk(8192):
             f.write(chunk)
-            size += len(chunk)
 
     return web.json_response({
         "name": filename,

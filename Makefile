@@ -6,7 +6,7 @@
 
 js:
 	@echo "→ Syncing JS files to js/"
-	cp audio_loader/js/audio_loader.js       js/audio_loader.js
+	cp audio_loader/js/audio_loader.js           js/audio_loader.js
 	cp resolution_master/js/resolution_master.js js/resolution_master.js
 	@echo "✓ Done"
 

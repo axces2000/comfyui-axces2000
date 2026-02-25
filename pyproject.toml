@@ -1,9 +1,9 @@
 [project]
 name = "comfyui-axces2000"
 description = "Custom ComfyUI nodes by axces2000 — Audio Loader, Resolution Master, and more"
-version = "1.1.0"
+version = "1.2.0"
 license = { file = "LICENSE.txt" }
-dependencies = ["torchaudio"]
+dependencies = ["torchaudio", "soundfile"]
 
 [project.urls]
 Repository = "https://github.com/axces2000/comfyui-axces2000"

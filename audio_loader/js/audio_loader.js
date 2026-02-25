@@ -2,52 +2,69 @@
  * AudioLoader Widget for ComfyUI
  * Provides: drag-and-drop upload, waveform visualization,
  * play/pause/stop controls, position indicator, duration display.
+ *
+ * v1.3.0 — Fixed drag & drop by using node.onDragDrop, which is the hook
+ *           ComfyUI's modern frontend (useNodeDragAndDrop.ts) actually calls.
+ *           The old node.onDrop / document capture approach both failed because
+ *           the Vue frontend never invokes those paths for file drops on nodes.
  */
 
-import { app } from "../../scripts/app.js";
-import { api } from "../../scripts/api.js";
+import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const WIDGET_HEIGHT = 160;
+const WIDGET_HEIGHT  = 160;
 const WAVEFORM_COLOR = "#4ade80";
-const WAVEFORM_PLAYED_COLOR = "#86efac";
-const WAVEFORM_BG = "#0f172a";
+const WAVEFORM_BG    = "#0f172a";
 const PLAYHEAD_COLOR = "#f8fafc";
-const ACCENT = "#22d3ee";
-const NODE_WIDTH = 340;
+const ACCENT         = "#22d3ee";
+const NODE_WIDTH     = 340;
+
+const AUDIO_EXTENSIONS = new Set([
+  "mp3", "wav", "wave", "flac", "ogg", "aac", "m4a", "opus", "weba"
+]);
+
+function isAudioFile(file) {
+  if (!file) return false;
+  // Check MIME type first
+  if (file.type && file.type.startsWith("audio/")) return true;
+  // Fallback: extension (handles files with generic MIME like application/octet-stream)
+  const ext = file.name?.split(".").pop()?.toLowerCase();
+  return AUDIO_EXTENSIONS.has(ext);
+}
 
 // ─── Utility: format seconds → HH:MM:SS.mmm ──────────────────────────────────
 function formatDuration(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "00:00:00.000";
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
+  const h  = Math.floor(seconds / 3600);
+  const m  = Math.floor((seconds % 3600) / 60);
+  const s  = Math.floor(seconds % 60);
   const ms = Math.floor((seconds % 1) * 1000);
-  return [
-    String(h).padStart(2, "0"),
-    String(m).padStart(2, "0"),
-    String(s).padStart(2, "0"),
-  ].join(":") + "." + String(ms).padStart(3, "0");
+  return (
+    String(h).padStart(2, "0") + ":" +
+    String(m).padStart(2, "0") + ":" +
+    String(s).padStart(2, "0") + "." +
+    String(ms).padStart(3, "0")
+  );
 }
 
-// ─── Waveform decoder (runs in worker-like async fashion) ─────────────────────
+// ─── Waveform decoder ─────────────────────────────────────────────────────────
 async function decodeWaveformPeaks(arrayBuffer, numBars = 200) {
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   try {
     const decoded = await audioCtx.decodeAudioData(arrayBuffer);
-    const channelData = decoded.getChannelData(0); // use first channel
-    const blockSize = Math.floor(channelData.length / numBars);
-    const peaks = [];
+    const channel = decoded.getChannelData(0);
+    const block   = Math.floor(channel.length / numBars);
+    const peaks   = [];
     for (let i = 0; i < numBars; i++) {
       let max = 0;
-      const start = i * blockSize;
-      for (let j = 0; j < blockSize; j++) {
-        const val = Math.abs(channelData[start + j]);
-        if (val > max) max = val;
+      const start = i * block;
+      for (let j = 0; j < block; j++) {
+        const v = Math.abs(channel[start + j]);
+        if (v > max) max = v;
       }
       peaks.push(max);
     }
-    // Normalize
     const globalMax = Math.max(...peaks, 0.001);
     return { peaks: peaks.map(p => p / globalMax), duration: decoded.duration };
   } finally {
@@ -56,85 +73,66 @@ async function decodeWaveformPeaks(arrayBuffer, numBars = 200) {
 }
 
 // ─── Main Widget Factory ──────────────────────────────────────────────────────
-function createAudioWidget(node, inputName, inputData) {
-  // State
-  let audioUrl = null;
-  let audioPeaks = [];
-  let audioDuration = 0;
-  let audioElement = null;
-  let playState = "stopped"; // 'stopped' | 'playing' | 'paused'
-  let playheadPos = 0; // 0..1
-  let animFrame = null;
+function createAudioWidget(node, inputName) {
+  let audioPeaks         = [];
+  let audioDuration      = 0;
+  let audioElement       = null;
+  let playState          = "stopped";
+  let playheadPos        = 0;
+  let animFrame          = null;
   let isDraggingPlayhead = false;
-  let isDragOver = false;
-  let currentFilename = null;
+  let isDragOver         = false;
+  let currentFilename    = null;
 
-  // ─── Canvas widget ───────────────────────────────────────────────────────
-  const widget = node.addWidget("AUDIO_LOADER_WIDGET", inputName, "", () => {}, {
-    serialize: true,
-  });
-
+  const widget = node.addWidget(
+    "AUDIO_LOADER_WIDGET", inputName, "", () => {}, { serialize: true }
+  );
   widget.computeSize = () => [NODE_WIDTH, WIDGET_HEIGHT + 60];
 
-  // ─── Audio element setup ─────────────────────────────────────────────────
+  // ── Audio element setup ───────────────────────────────────────────────────
   function setupAudio(url) {
-    if (audioElement) {
-      audioElement.pause();
-      audioElement.src = "";
-    }
+    if (audioElement) { audioElement.pause(); audioElement.src = ""; }
     audioElement = new Audio(url);
     audioElement.addEventListener("ended", () => {
-      playState = "stopped";
-      playheadPos = 0;
+      playState = "stopped"; playheadPos = 0;
       cancelAnimationFrame(animFrame);
       node.setDirtyCanvas(true, false);
     });
-    audioElement.addEventListener("error", (e) => {
-      console.error("[AudioLoader] Audio playback error", e);
-    });
   }
 
-  function updatePlayhead() {
-    if (audioElement && audioElement.duration) {
+  function tickPlayhead() {
+    if (audioElement?.duration) {
       playheadPos = audioElement.currentTime / audioElement.duration;
     }
     node.setDirtyCanvas(true, false);
-    if (playState === "playing") {
-      animFrame = requestAnimationFrame(updatePlayhead);
-    }
+    if (playState === "playing") animFrame = requestAnimationFrame(tickPlayhead);
   }
 
-  // ─── Load file from ComfyUI input dir ───────────────────────────────────
+  // ── File loading ──────────────────────────────────────────────────────────
   async function loadAudioFile(filename) {
     currentFilename = filename;
-    widget.value = filename;
-
-    const url = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input`);
-    audioUrl = url;
-
-    // Decode waveform
+    widget.value    = filename;
+    const url = api.apiURL(
+      `/view?filename=${encodeURIComponent(filename)}&type=input`
+    );
     try {
-      const res = await fetch(url);
-      const buf = await res.arrayBuffer();
+      const res    = await fetch(url);
+      const buf    = await res.arrayBuffer();
       const result = await decodeWaveformPeaks(buf.slice(0));
-      audioPeaks = result.peaks;
+      audioPeaks    = result.peaks;
       audioDuration = result.duration;
     } catch (e) {
       console.error("[AudioLoader] Waveform decode error", e);
-      audioPeaks = [];
-      audioDuration = 0;
+      audioPeaks = []; audioDuration = 0;
     }
-
     setupAudio(url);
-    playState = "stopped";
-    playheadPos = 0;
+    playState = "stopped"; playheadPos = 0;
     node.setDirtyCanvas(true, false);
   }
 
-  // ─── Upload handler ──────────────────────────────────────────────────────
   async function uploadFile(file) {
     const formData = new FormData();
-    formData.append("image", file, file.name); // ComfyUI uses "image" field
+    formData.append("image", file, file.name);
     try {
       const res = await api.fetchApi("/upload/audio", { method: "POST", body: formData });
       if (!res.ok) throw new Error(await res.text());
@@ -142,299 +140,235 @@ function createAudioWidget(node, inputName, inputData) {
       await loadAudioFile(data.name);
     } catch (e) {
       console.error("[AudioLoader] Upload error", e);
-      alert("Upload failed: " + e.message);
+      alert("Audio upload failed: " + e.message);
     }
   }
 
-  // ─── Draw ────────────────────────────────────────────────────────────────
-  widget.draw = function (ctx, node, width, y, height) {
-    const x = 10;
-    const w = width - 20;
-    const waveH = WIDGET_HEIGHT;
-    const controlsY = y + waveH + 4;
+  // ── Draw ──────────────────────────────────────────────────────────────────
+  widget.draw = function (ctx, node, width, y) {
+    const px = 10, pw = width - 20;
 
     // Background
     ctx.fillStyle = WAVEFORM_BG;
-    ctx.beginPath();
-    ctx.roundRect(x, y, w, waveH, 8);
-    ctx.fill();
+    ctx.beginPath(); ctx.roundRect(px, y, pw, WIDGET_HEIGHT, 8); ctx.fill();
 
-    // Border (highlighted when drag over)
+    // Border — highlight on drag-over
     ctx.strokeStyle = isDragOver ? ACCENT : "#1e293b";
-    ctx.lineWidth = isDragOver ? 2 : 1;
-    ctx.beginPath();
-    ctx.roundRect(x, y, w, waveH, 8);
-    ctx.stroke();
+    ctx.lineWidth   = isDragOver ? 2 : 1;
+    ctx.beginPath(); ctx.roundRect(px, y, pw, WIDGET_HEIGHT, 8); ctx.stroke();
 
-    // ── Waveform bars ──
     if (audioPeaks.length > 0) {
+      // Waveform bars
       const barCount = audioPeaks.length;
-      const barW = (w - 20) / barCount;
-      const centerY = y + waveH / 2;
-      const maxBarH = waveH / 2 - 12;
-
+      const barW     = (pw - 20) / barCount;
+      const centerY  = y + WIDGET_HEIGHT / 2;
+      const maxBarH  = WIDGET_HEIGHT / 2 - 12;
       for (let i = 0; i < barCount; i++) {
-        const bx = x + 10 + i * barW;
-        const bh = Math.max(2, audioPeaks[i] * maxBarH);
-        const frac = i / barCount;
-        const played = frac <= playheadPos;
+        const bx     = px + 10 + i * barW;
+        const bh     = Math.max(2, audioPeaks[i] * maxBarH);
+        const played = (i / barCount) <= playheadPos;
         ctx.fillStyle = played ? WAVEFORM_COLOR : "#1e3a2f";
         ctx.beginPath();
         ctx.roundRect(bx, centerY - bh, Math.max(1, barW - 1), bh * 2, 1);
         ctx.fill();
       }
-
       // Playhead line
-      const phX = x + 10 + playheadPos * (w - 20);
-      ctx.strokeStyle = PLAYHEAD_COLOR;
-      ctx.lineWidth = 2;
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.moveTo(phX, y + 6);
-      ctx.lineTo(phX, y + waveH - 6);
-      ctx.stroke();
-
+      const phX = px + 10 + playheadPos * (pw - 20);
+      ctx.strokeStyle = PLAYHEAD_COLOR; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(phX, y + 6); ctx.lineTo(phX, y + WIDGET_HEIGHT - 6); ctx.stroke();
       // Playhead triangle
       ctx.fillStyle = PLAYHEAD_COLOR;
       ctx.beginPath();
-      ctx.moveTo(phX - 5, y + 6);
-      ctx.lineTo(phX + 5, y + 6);
-      ctx.lineTo(phX, y + 14);
-      ctx.closePath();
-      ctx.fill();
-
+      ctx.moveTo(phX - 5, y + 6); ctx.lineTo(phX + 5, y + 6); ctx.lineTo(phX, y + 14);
+      ctx.closePath(); ctx.fill();
     } else {
-      // Empty state / drag prompt
+      // Empty state prompt
       ctx.fillStyle = isDragOver ? ACCENT : "#334155";
-      ctx.font = "bold 13px monospace";
-      ctx.textAlign = "center";
+      ctx.font = "bold 13px monospace"; ctx.textAlign = "center";
       ctx.fillText(
         isDragOver ? "Drop audio file here" : "🎵  Drag & drop audio  /  select below",
-        x + w / 2,
-        y + waveH / 2 - 8
+        px + pw / 2, y + WIDGET_HEIGHT / 2 - 8
       );
-      ctx.font = "11px monospace";
-      ctx.fillStyle = "#64748b";
-      ctx.fillText("MP3 · WAV · FLAC · OGG · AAC · M4A", x + w / 2, y + waveH / 2 + 12);
+      ctx.font = "11px monospace"; ctx.fillStyle = "#64748b";
+      ctx.fillText("MP3 · WAV · FLAC · OGG · AAC · M4A", px + pw / 2, y + WIDGET_HEIGHT / 2 + 12);
       ctx.textAlign = "left";
     }
 
-    // ── Duration display ──
-    const currentTime = audioElement ? audioElement.currentTime : 0;
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "10px monospace";
-    ctx.textAlign = "left";
-    ctx.fillText(formatDuration(currentTime), x + 12, y + waveH - 6);
-    ctx.textAlign = "right";
-    ctx.fillText(formatDuration(audioDuration), x + w - 12, y + waveH - 6);
+    // Time labels
+    const currentTime = audioElement?.currentTime ?? 0;
+    ctx.fillStyle = "#94a3b8"; ctx.font = "10px monospace";
+    ctx.textAlign = "left";  ctx.fillText(formatDuration(currentTime),  px + 12,      y + WIDGET_HEIGHT - 6);
+    ctx.textAlign = "right"; ctx.fillText(formatDuration(audioDuration), px + pw - 12, y + WIDGET_HEIGHT - 6);
     ctx.textAlign = "left";
 
-    // ── Filename ──
+    // Filename
     if (currentFilename) {
-      ctx.fillStyle = "#64748b";
-      ctx.font = "10px monospace";
-      ctx.textAlign = "center";
-      const truncated = currentFilename.length > 40
-        ? currentFilename.slice(0, 38) + "…"
-        : currentFilename;
-      ctx.fillText(truncated, x + w / 2, y + waveH + 16);
+      ctx.fillStyle = "#64748b"; ctx.font = "10px monospace"; ctx.textAlign = "center";
+      const t = currentFilename.length > 40 ? currentFilename.slice(0, 38) + "…" : currentFilename;
+      ctx.fillText(t, px + pw / 2, y + WIDGET_HEIGHT + 16);
       ctx.textAlign = "left";
     }
 
-    // ── Controls ──
-    const btnY = controlsY + (currentFilename ? 22 : 6);
-    const btnSize = 28;
-    const btnGap = 8;
-    const totalBtns = 3;
-    const totalBtnW = totalBtns * btnSize + (totalBtns - 1) * btnGap;
-    const btnStartX = x + w / 2 - totalBtnW / 2;
-
-    const buttons = [
+    // Transport buttons
+    const btnY      = y + WIDGET_HEIGHT + (currentFilename ? 22 : 6);
+    const btnSize   = 28, btnGap = 8;
+    const btnStartX = px + pw / 2 - (2 * btnSize + btnGap) / 2;
+    const buttons   = [
       { label: playState === "playing" ? "⏸" : "▶", action: "play", bx: btnStartX },
       { label: "⏹", action: "stop", bx: btnStartX + btnSize + btnGap },
     ];
-
-    // Store button positions for hit testing
     widget._buttons = buttons.map(b => ({ ...b, y: btnY, size: btnSize }));
-
     buttons.forEach(btn => {
       const active = btn.action === "play" && playState === "playing";
-      ctx.fillStyle = active ? ACCENT : "#1e293b";
+      ctx.fillStyle   = active ? ACCENT : "#1e293b";
       ctx.strokeStyle = active ? ACCENT : "#334155";
       ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(btn.bx, btnY, btnSize, btnSize, 6);
-      ctx.fill();
-      ctx.stroke();
-
+      ctx.beginPath(); ctx.roundRect(btn.bx, btnY, btnSize, btnSize, 6); ctx.fill(); ctx.stroke();
       ctx.fillStyle = active ? "#0f172a" : "#e2e8f0";
-      ctx.font = "14px sans-serif";
-      ctx.textAlign = "center";
+      ctx.font = "14px sans-serif"; ctx.textAlign = "center";
       ctx.fillText(btn.label, btn.bx + btnSize / 2, btnY + btnSize / 2 + 5);
       ctx.textAlign = "left";
     });
 
-    // Disable hint if no audio
-    if (!currentFilename) {
-      ctx.fillStyle = "#334155";
-      ctx.font = "10px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText("Load a file to enable playback", x + w / 2, btnY + btnSize + 16);
-      ctx.textAlign = "left";
-    }
+    widget._lastY = y;
   };
 
-  // ─── Mouse events ────────────────────────────────────────────────────────
+  // ── Mouse: seek bar + button clicks ──────────────────────────────────────
   widget.mouse = function (event, pos, node) {
     const [mx, my] = pos;
-    const x = 10;
-    const w = node.size[0] - 20;
-    const waveTop = this.last_y || 0;
-    const waveBottom = waveTop + WIDGET_HEIGHT;
+    const px = 10, pw = node.size[0] - 20;
+    const waveTop = widget._lastY ?? 0, waveBottom = waveTop + WIDGET_HEIGHT;
 
-    // Playhead drag on waveform
     if (audioPeaks.length > 0 && my >= waveTop && my <= waveBottom) {
-      if (event.type === "pointerdown") {
-        isDraggingPlayhead = true;
-      }
+      if (event.type === "pointerdown") isDraggingPlayhead = true;
     }
-
     if (isDraggingPlayhead) {
-      const frac = Math.max(0, Math.min(1, (mx - x - 10) / (w - 20)));
+      const frac = Math.max(0, Math.min(1, (mx - px - 10) / (pw - 20)));
       playheadPos = frac;
-      if (audioElement && audioElement.duration) {
-        audioElement.currentTime = frac * audioElement.duration;
-      }
+      if (audioElement?.duration) audioElement.currentTime = frac * audioElement.duration;
       if (event.type === "pointerup") isDraggingPlayhead = false;
       node.setDirtyCanvas(true, false);
       return true;
     }
-
-    // Button hits
     if (event.type === "pointerdown" && widget._buttons) {
       for (const btn of widget._buttons) {
         if (mx >= btn.bx && mx <= btn.bx + btn.size && my >= btn.y && my <= btn.y + btn.size) {
-          handleButtonClick(btn.action);
-          return true;
+          handleButton(btn.action); return true;
         }
       }
     }
-
     return false;
   };
 
-  function handleButtonClick(action) {
+  function handleButton(action) {
     if (!audioElement) return;
     if (action === "play") {
       if (playState === "playing") {
-        audioElement.pause();
-        playState = "paused";
-        cancelAnimationFrame(animFrame);
+        audioElement.pause(); playState = "paused"; cancelAnimationFrame(animFrame);
       } else {
-        audioElement.play();
-        playState = "playing";
-        animFrame = requestAnimationFrame(updatePlayhead);
+        audioElement.play(); playState = "playing"; animFrame = requestAnimationFrame(tickPlayhead);
       }
     } else if (action === "stop") {
-      audioElement.pause();
-      audioElement.currentTime = 0;
-      playState = "stopped";
-      playheadPos = 0;
-      cancelAnimationFrame(animFrame);
+      audioElement.pause(); audioElement.currentTime = 0;
+      playState = "stopped"; playheadPos = 0; cancelAnimationFrame(animFrame);
     }
     node.setDirtyCanvas(true, false);
   }
 
-  // ─── Serialize / deserialize ─────────────────────────────────────────────
-  widget.serializeValue = function () {
-    return currentFilename || "";
+  widget.serializeValue = () => currentFilename ?? "";
+  if (widget.value) loadAudioFile(widget.value);
+
+  // ── Expose helpers ────────────────────────────────────────────────────────
+  widget._loadAudioFile = loadAudioFile;
+  widget._uploadFile    = uploadFile;
+  widget._setDragOver   = (v) => { isDragOver = v; node.setDirtyCanvas(true, false); };
+
+  // ── Drag & Drop — THE CORRECT COMFYUI HOOKS ──────────────────────────────
+  //
+  // ComfyUI's modern Vue frontend (useNodeDragAndDrop.ts) calls these two
+  // callbacks on the node object — NOT the old LiteGraph node.onDrop, and NOT
+  // document-level capture listeners. The call chain from the frontend is:
+  //
+  //   canvas drop event
+  //     → app.ts checks node under cursor
+  //     → calls node.onDragOver(e)  — if returns true, drop is accepted
+  //     → calls node.onDragDrop(e)  — receives the actual files
+  //
+  // This is identical to how the built-in Load Image node works.
+  // Returning true from onDragOver is REQUIRED — without it onDragDrop
+  // never fires and ComfyUI's "no workflow" handler takes over instead.
+
+  node.onDragOver = function (e) {
+    if (e.dataTransfer?.items) {
+      const hasFile = [...e.dataTransfer.items].some(i => i.kind === "file");
+      if (hasFile) {
+        widget._setDragOver(true);
+        return true;   // ← tells ComfyUI: "yes, this node accepts this drop"
+      }
+    }
+    widget._setDragOver(false);
+    return false;
   };
 
-  // ─── Initial value load ──────────────────────────────────────────────────
-  const initialValue = widget.value;
-  if (initialValue && initialValue !== "") {
-    loadAudioFile(initialValue);
-  }
+  node.onDragDrop = async function (e) {
+    widget._setDragOver(false);
+    const file = e.dataTransfer?.files?.[0];
+    if (file && isAudioFile(file)) {
+      await uploadFile(file);
+      return true;   // ← consumed; ComfyUI won't process further
+    }
+    return false;    // ← not our file type; let ComfyUI handle it normally
+  };
 
-  // ─── Drag and drop on the canvas ─────────────────────────────────────────
-  // We hook into the node's canvas drag events via a hidden file input + canvas listeners.
-  // ComfyUI's canvas captures drag events globally; we intercept via node event hooks.
-
-  // Expose loadAudioFile so the file selector (added below) can call it
-  widget._loadAudioFile = loadAudioFile;
-  widget._uploadFile = uploadFile;
-  widget._setDragOver = (val) => { isDragOver = val; node.setDirtyCanvas(true, false); };
+  // Cleanup on node removal
+  const origOnRemoved = node.onRemoved?.bind(node);
+  node.onRemoved = function () {
+    if (audioElement) { audioElement.pause(); audioElement.src = ""; }
+    cancelAnimationFrame(animFrame);
+    origOnRemoved?.();
+  };
 
   return widget;
 }
 
-
 // ─── Register extension ───────────────────────────────────────────────────────
 app.registerExtension({
-  name: "AudioLoader.Widget",
+  name: "Axces2000.AudioLoader",
 
-  async beforeRegisterNodeDef(nodeType, nodeData, app) {
+  async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData.name !== "AudioLoader") return;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       onNodeCreated?.apply(this, arguments);
-
       this.serialize_widgets = true;
 
-      // Remove auto-generated combo widget for "audio" input — we replace it
-      const existingIdx = this.widgets?.findIndex(w => w.name === "audio");
-      if (existingIdx !== undefined && existingIdx >= 0) {
-        this.widgets.splice(existingIdx, 1);
-      }
+      // Remove the auto-generated combo widget and replace with ours
+      const idx = this.widgets?.findIndex(w => w.name === "audio");
+      if (idx !== undefined && idx >= 0) this.widgets.splice(idx, 1);
 
-      // Create our custom widget
-      const audioWidget = createAudioWidget(this, "audio", {});
+      createAudioWidget(this, "audio");
       this.size = [NODE_WIDTH + 20, WIDGET_HEIGHT + 120];
 
-      // ── File selector button widget ──────────────────────────────────────
-      const btnWidget = this.addWidget("button", "📁 Browse file", null, () => {
+      // File browser button
+      this.addWidget("button", "📁 Browse file", null, () => {
         const input = document.createElement("input");
-        input.type = "file";
-        input.accept = "audio/*";
+        input.type = "file"; input.accept = "audio/*";
         input.onchange = async (e) => {
           const file = e.target.files[0];
-          if (file) await audioWidget._uploadFile(file);
+          if (!file) return;
+          const aw = this.widgets?.find(w => w.name === "audio" && w._uploadFile);
+          if (aw) await aw._uploadFile(file);
         };
         input.click();
       });
-
-      // ── Drag & drop on the ComfyUI canvas ─────────────────────────────
-      // We patch the node's onDragOver / onDrop which LiteGraph calls.
-      this.onDragOver = function (e) {
-        if (e.dataTransfer?.types?.includes("Files")) {
-          audioWidget._setDragOver(true);
-          return true;
-        }
-        return false;
-      };
-
-      this.onDragLeave = function () {
-        audioWidget._setDragOver(false);
-      };
-
-      this.onDrop = async function (e) {
-        audioWidget._setDragOver(false);
-        const file = e.dataTransfer?.files?.[0];
-        if (file && file.type.startsWith("audio/")) {
-          await audioWidget._uploadFile(file);
-        }
-      };
     };
 
-    // Serialize / restore
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (config) {
       onConfigure?.apply(this, arguments);
-      const audioWidget = this.widgets?.find(w => w.name === "audio");
-      if (audioWidget && config.widgets_values?.[0]) {
-        audioWidget._loadAudioFile(config.widgets_values[0]);
-      }
+      const aw = this.widgets?.find(w => w.name === "audio" && w._loadAudioFile);
+      if (aw && config.widgets_values?.[0]) aw._loadAudioFile(config.widgets_values[0]);
     };
   },
 });

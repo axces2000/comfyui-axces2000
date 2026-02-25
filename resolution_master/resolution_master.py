@@ -5,16 +5,16 @@ Outputs width and height for standard resolutions across square/landscape/portra
 
 # ─── Resolution table ─────────────────────────────────────────────────────────
 RESOLUTIONS = {
-    "SD (480p)":   {"landscape": (720,  480),  "square": (512,  512),  "portrait": (480,  720)},
-    "1K (720p)":   {"landscape": (1280, 720),  "square": (1024, 1024), "portrait": (720,  1280)},
-    "1.3K (768p)": {"landscape": (1344, 768),  "square": (1024, 1024), "portrait": (768,  1344)},
-    "2K (1080p)":  {"landscape": (1920, 1080), "square": (1536, 1536), "portrait": (1080, 1920)},
-    "2.5K (1440p)":{"landscape": (2560, 1440), "square": (1920, 1920), "portrait": (1440, 2560)},
-    "4K (2160p)":  {"landscape": (3840, 2160), "square": (2048, 2048), "portrait": (2160, 3840)},
-    "8K (4320p)":  {"landscape": (7680, 4320), "square": (5760, 5760), "portrait": (4320, 7680)},
+    "SD (480p)":    {"landscape": (720,  480),  "square": (512,  512),  "portrait": (480,  720)},
+    "1K (720p)":    {"landscape": (1280, 720),  "square": (1024, 1024), "portrait": (720,  1280)},
+    "1.3K (768p)":  {"landscape": (1344, 768),  "square": (1024, 1024), "portrait": (768,  1344)},
+    "2K (1080p)":   {"landscape": (1920, 1080), "square": (1536, 1536), "portrait": (1080, 1920)},
+    "2.5K (1440p)": {"landscape": (2560, 1440), "square": (1920, 1920), "portrait": (1440, 2560)},
+    "4K (2160p)":   {"landscape": (3840, 2160), "square": (2048, 2048), "portrait": (2160, 3840)},
+    "8K (4320p)":   {"landscape": (7680, 4320), "square": (5760, 5760), "portrait": (4320, 7680)},
 }
 
-ORIENTATIONS = ["landscape", "square", "portrait"]
+ORIENTATIONS     = ["landscape", "square", "portrait"]
 RESOLUTION_NAMES = list(RESOLUTIONS.keys())
 
 
@@ -28,8 +28,8 @@ class ResolutionMasterNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "resolution": (RESOLUTION_NAMES, {"default": "2K (1080p)"}),
-                "orientation": (ORIENTATIONS,    {"default": "landscape"}),
+                "resolution":  (RESOLUTION_NAMES, {"default": "2K (1080p)"}),
+                "orientation": (ORIENTATIONS,     {"default": "landscape"}),
             }
         }
 
@@ -41,12 +41,10 @@ class ResolutionMasterNode:
 
     def get_resolution(self, resolution, orientation):
         w, h = RESOLUTIONS[resolution][orientation]
-        res_string = f"{w}x{h}"
-        return (w, h, res_string)
+        return (w, h, f"{w}x{h}")
 
     @classmethod
     def IS_CHANGED(cls, resolution, orientation):
-        # Always deterministic — no file I/O, no randomness
         return f"{resolution}_{orientation}"
 
 
