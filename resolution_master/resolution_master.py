@@ -31,11 +31,11 @@ def parse_combined(value: str):
     The separator is the last underscore since res names never end with one."""
     last = value.rfind("_")
     if last == -1:
-        return "2K (1080p)", "landscape"
+        return "1.3K (768p)", "landscape"
     res    = value[:last]
     orient = value[last + 1:]
     if res not in RESOLUTIONS or orient not in ORIENTATIONS:
-        return "2K (1080p)", "landscape"
+        return "1.3K (768p)", "landscape"
     return res, orient
 
 
@@ -52,7 +52,7 @@ class ResolutionMasterNode:
             "required": {
                 # One combined string input — the JS widget owns this entirely.
                 # We list all valid values so ComfyUI's validator is satisfied.
-                "resolution": (COMBINED_VALUES, {"default": "2K (1080p)_landscape"}),
+                "resolution": (COMBINED_VALUES, {"default": "1.3K (768p)_landscape"}),
             }
         }
 

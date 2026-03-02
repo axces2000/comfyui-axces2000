@@ -51,14 +51,14 @@ const NODE_W   = 310;
 
 // ─── Widget factory ───────────────────────────────────────────────────────────
 function createResolutionWidget(node) {
-  let selectedRes    = "2K (1080p)";
+  let selectedRes    = "1.3K (768p)";
   let selectedOrient = "landscape";
   let hoveredOrient  = null;
 
   // The widget name MUST match the Python input name exactly: "resolution"
   // Its value is the combined string "RES_orient" that Python parses.
   const widget = node.addWidget(
-    "RESOLUTION_MASTER_WIDGET", "resolution", "2K (1080p)_landscape", () => {}, { serialize: true }
+    "RESOLUTION_MASTER_WIDGET", "resolution", "1.3K (768p)_landscape", () => {}, { serialize: true }
   );
 
   widget.computeSize = () => [NODE_W, WIDGET_H];
