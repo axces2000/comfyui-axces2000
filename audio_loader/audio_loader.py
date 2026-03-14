@@ -20,10 +20,13 @@ class AudioLoaderNode:
 
     @classmethod
     def INPUT_TYPES(cls):
-        audio_files = folder_paths.get_filename_list("audio")
+        # STRING instead of a dynamic combo list.
+        # A dynamic list causes validation failure on workflow restore when
+        # the list is empty or not yet refreshed — the saved filename gets
+        # rejected as "not in list". STRING accepts any value unconditionally.
         return {
             "required": {
-                "audio": (sorted(audio_files),),
+                "audio": ("STRING", {"default": ""}),
             },
             "optional": {
                 "normalize": ("BOOLEAN", {"default": False}),
@@ -96,10 +99,24 @@ class AudioLoaderNode:
         )
 
     def load_audio(self, audio, normalize=False):
+        if not audio or audio.strip() == "":
+            raise ValueError("No audio file selected. Please upload or select an audio file.")
+
+        # Resolve to absolute path — handles both plain filenames and
+        # annotated paths (e.g. "filename [subfolder/type]") that ComfyUI may produce.
         audio_path = folder_paths.get_annotated_filepath(audio)
 
+        # If not found via annotation, try resolving directly in the input dir
         if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            input_dir = folder_paths.get_input_directory()
+            candidate = os.path.join(input_dir, os.path.basename(audio))
+            if os.path.exists(candidate):
+                audio_path = candidate
+            else:
+                raise FileNotFoundError(
+                    f"Audio file not found: '{audio}'. "
+                    f"Make sure the file exists in the ComfyUI input directory."
+                )
 
         waveform, sample_rate = self._load_waveform(audio_path)
 
@@ -132,16 +149,20 @@ class AudioLoaderNode:
 
     @classmethod
     def IS_CHANGED(cls, audio, normalize=False):
-        audio_path = folder_paths.get_annotated_filepath(audio)
-        if os.path.exists(audio_path):
-            return os.path.getmtime(audio_path)
-        return float("nan")
+        # Return mtime so ComfyUI re-executes if the file changes on disk.
+        # Fall back to the audio string so it still re-executes on name change.
+        try:
+            audio_path = folder_paths.get_annotated_filepath(audio)
+            if os.path.exists(audio_path):
+                return os.path.getmtime(audio_path)
+        except Exception:
+            pass
+        return audio
 
-    @classmethod
-    def VALIDATE_INPUTS(cls, audio, normalize=False):
-        if not folder_paths.exists_annotated_filepath(audio):
-            return f"Audio file does not exist: {audio}"
-        return True
+    # VALIDATE_INPUTS intentionally omitted.
+    # The previous implementation rejected filenames that weren't yet in the
+    # annotated filepath cache at load time, breaking workflow restore entirely.
+    # load_audio() raises clear errors itself if the file is genuinely missing.
 
 
 # Register upload endpoint for the drag-and-drop widget

@@ -3,10 +3,12 @@
  * Provides: drag-and-drop upload, waveform visualization,
  * play/pause/stop controls, position indicator, duration display.
  *
- * v1.3.0 — Fixed drag & drop by using node.onDragDrop, which is the hook
- *           ComfyUI's modern frontend (useNodeDragAndDrop.ts) actually calls.
- *           The old node.onDrop / document capture approach both failed because
- *           the Vue frontend never invokes those paths for file drops on nodes.
+ * v1.4.0 — Fixed workflow save/restore:
+ *           - Python input changed to STRING so saved filenames are never
+ *             rejected by the "not in list" validator on reload.
+ *           - onConfigure now restores by matching widget name in the node's
+ *             input definitions rather than assuming a fixed array index.
+ *           - serializeValue always returns the filename string (never null/undefined).
  */
 
 import { app } from "../../../scripts/app.js";
@@ -26,9 +28,7 @@ const AUDIO_EXTENSIONS = new Set([
 
 function isAudioFile(file) {
   if (!file) return false;
-  // Check MIME type first
   if (file.type && file.type.startsWith("audio/")) return true;
-  // Fallback: extension (handles files with generic MIME like application/octet-stream)
   const ext = file.name?.split(".").pop()?.toLowerCase();
   return AUDIO_EXTENSIONS.has(ext);
 }
@@ -110,8 +110,9 @@ function createAudioWidget(node, inputName) {
 
   // ── File loading ──────────────────────────────────────────────────────────
   async function loadAudioFile(filename) {
-    currentFilename = filename;
-    widget.value    = filename;
+    if (!filename || filename.trim() === "") return;
+    currentFilename  = filename;
+    widget.value     = filename;   // keep widget value in sync at all times
     const url = api.apiURL(
       `/view?filename=${encodeURIComponent(filename)}&type=input`
     );
@@ -148,17 +149,14 @@ function createAudioWidget(node, inputName) {
   widget.draw = function (ctx, node, width, y) {
     const px = 10, pw = width - 20;
 
-    // Background
     ctx.fillStyle = WAVEFORM_BG;
     ctx.beginPath(); ctx.roundRect(px, y, pw, WIDGET_HEIGHT, 8); ctx.fill();
 
-    // Border — highlight on drag-over
     ctx.strokeStyle = isDragOver ? ACCENT : "#1e293b";
     ctx.lineWidth   = isDragOver ? 2 : 1;
     ctx.beginPath(); ctx.roundRect(px, y, pw, WIDGET_HEIGHT, 8); ctx.stroke();
 
     if (audioPeaks.length > 0) {
-      // Waveform bars
       const barCount = audioPeaks.length;
       const barW     = (pw - 20) / barCount;
       const centerY  = y + WIDGET_HEIGHT / 2;
@@ -172,17 +170,14 @@ function createAudioWidget(node, inputName) {
         ctx.roundRect(bx, centerY - bh, Math.max(1, barW - 1), bh * 2, 1);
         ctx.fill();
       }
-      // Playhead line
       const phX = px + 10 + playheadPos * (pw - 20);
       ctx.strokeStyle = PLAYHEAD_COLOR; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(phX, y + 6); ctx.lineTo(phX, y + WIDGET_HEIGHT - 6); ctx.stroke();
-      // Playhead triangle
       ctx.fillStyle = PLAYHEAD_COLOR;
       ctx.beginPath();
       ctx.moveTo(phX - 5, y + 6); ctx.lineTo(phX + 5, y + 6); ctx.lineTo(phX, y + 14);
       ctx.closePath(); ctx.fill();
     } else {
-      // Empty state prompt
       ctx.fillStyle = isDragOver ? ACCENT : "#334155";
       ctx.font = "bold 13px monospace"; ctx.textAlign = "center";
       ctx.fillText(
@@ -194,14 +189,12 @@ function createAudioWidget(node, inputName) {
       ctx.textAlign = "left";
     }
 
-    // Time labels
     const currentTime = audioElement?.currentTime ?? 0;
     ctx.fillStyle = "#94a3b8"; ctx.font = "10px monospace";
     ctx.textAlign = "left";  ctx.fillText(formatDuration(currentTime),  px + 12,      y + WIDGET_HEIGHT - 6);
     ctx.textAlign = "right"; ctx.fillText(formatDuration(audioDuration), px + pw - 12, y + WIDGET_HEIGHT - 6);
     ctx.textAlign = "left";
 
-    // Filename
     if (currentFilename) {
       ctx.fillStyle = "#64748b"; ctx.font = "10px monospace"; ctx.textAlign = "center";
       const t = currentFilename.length > 40 ? currentFilename.slice(0, 38) + "…" : currentFilename;
@@ -209,7 +202,6 @@ function createAudioWidget(node, inputName) {
       ctx.textAlign = "left";
     }
 
-    // Transport buttons
     const btnY      = y + WIDGET_HEIGHT + (currentFilename ? 22 : 6);
     const btnSize   = 28, btnGap = 8;
     const btnStartX = px + pw / 2 - (2 * btnSize + btnGap) / 2;
@@ -233,7 +225,7 @@ function createAudioWidget(node, inputName) {
     widget._lastY = y;
   };
 
-  // ── Mouse: seek bar + button clicks ──────────────────────────────────────
+  // ── Mouse ─────────────────────────────────────────────────────────────────
   widget.mouse = function (event, pos, node) {
     const [mx, my] = pos;
     const px = 10, pw = node.size[0] - 20;
@@ -275,36 +267,21 @@ function createAudioWidget(node, inputName) {
     node.setDirtyCanvas(true, false);
   }
 
-  widget.serializeValue = () => currentFilename ?? "";
-  if (widget.value) loadAudioFile(widget.value);
+  // ── Serialization ─────────────────────────────────────────────────────────
+  // Always return the filename string. ComfyUI saves this into widgets_values
+  // in the workflow JSON and passes it back as the "audio" STRING input on load.
+  widget.serializeValue = () => currentFilename || "";
 
   // ── Expose helpers ────────────────────────────────────────────────────────
   widget._loadAudioFile = loadAudioFile;
   widget._uploadFile    = uploadFile;
   widget._setDragOver   = (v) => { isDragOver = v; node.setDirtyCanvas(true, false); };
 
-  // ── Drag & Drop — THE CORRECT COMFYUI HOOKS ──────────────────────────────
-  //
-  // ComfyUI's modern Vue frontend (useNodeDragAndDrop.ts) calls these two
-  // callbacks on the node object — NOT the old LiteGraph node.onDrop, and NOT
-  // document-level capture listeners. The call chain from the frontend is:
-  //
-  //   canvas drop event
-  //     → app.ts checks node under cursor
-  //     → calls node.onDragOver(e)  — if returns true, drop is accepted
-  //     → calls node.onDragDrop(e)  — receives the actual files
-  //
-  // This is identical to how the built-in Load Image node works.
-  // Returning true from onDragOver is REQUIRED — without it onDragDrop
-  // never fires and ComfyUI's "no workflow" handler takes over instead.
-
+  // ── Drag & Drop ───────────────────────────────────────────────────────────
   node.onDragOver = function (e) {
     if (e.dataTransfer?.items) {
       const hasFile = [...e.dataTransfer.items].some(i => i.kind === "file");
-      if (hasFile) {
-        widget._setDragOver(true);
-        return true;   // ← tells ComfyUI: "yes, this node accepts this drop"
-      }
+      if (hasFile) { widget._setDragOver(true); return true; }
     }
     widget._setDragOver(false);
     return false;
@@ -315,9 +292,9 @@ function createAudioWidget(node, inputName) {
     const file = e.dataTransfer?.files?.[0];
     if (file && isAudioFile(file)) {
       await uploadFile(file);
-      return true;   // ← consumed; ComfyUI won't process further
+      return true;
     }
-    return false;    // ← not our file type; let ComfyUI handle it normally
+    return false;
   };
 
   // Cleanup on node removal
@@ -343,14 +320,14 @@ app.registerExtension({
       onNodeCreated?.apply(this, arguments);
       this.serialize_widgets = true;
 
-      // Remove the auto-generated combo widget and replace with ours
+      // The Python input is now STRING type, so ComfyUI generates a text widget
+      // named "audio". Remove it and replace with our custom canvas widget.
       const idx = this.widgets?.findIndex(w => w.name === "audio");
       if (idx !== undefined && idx >= 0) this.widgets.splice(idx, 1);
 
       createAudioWidget(this, "audio");
       this.size = [NODE_WIDTH + 20, WIDGET_HEIGHT + 120];
 
-      // File browser button
       this.addWidget("button", "📁 Browse file", null, () => {
         const input = document.createElement("input");
         input.type = "file"; input.accept = "audio/*";
@@ -367,8 +344,25 @@ app.registerExtension({
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function (config) {
       onConfigure?.apply(this, arguments);
+
+      // Find the saved filename from widgets_values by matching the widget
+      // position in the node's input definition order — same method ComfyUI
+      // itself uses internally, which is robust regardless of array index.
+      //
+      // widgets_values is an array parallel to the node's widget list at save
+      // time. Our "audio" widget is always first (index 0) since it replaces
+      // the only required input. But we search by name to be safe.
       const aw = this.widgets?.find(w => w.name === "audio" && w._loadAudioFile);
-      if (aw && config.widgets_values?.[0]) aw._loadAudioFile(config.widgets_values[0]);
+      if (!aw) return;
+
+      // First try: read from widgets_values by index of our widget in the list
+      const widgetIndex = this.widgets.indexOf(aw);
+      const savedValue  = config.widgets_values?.[widgetIndex]
+                       ?? config.widgets_values?.[0];   // fallback to first slot
+
+      if (savedValue && savedValue.trim() !== "") {
+        aw._loadAudioFile(savedValue);
+      }
     };
   },
 });
