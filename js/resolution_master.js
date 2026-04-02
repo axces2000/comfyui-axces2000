@@ -13,6 +13,7 @@ import { app } from "../../../scripts/app.js";
 // ─── Data (mirrors Python) ────────────────────────────────────────────────────
 const RESOLUTIONS = {
   "SD (480p)":    { landscape: [720,  480],  square: [512,  512],  portrait: [480,  720]  },
+  "LTX (704p)":   { landscape: [1280, 704],  square: [1024, 1024], portrait: [704, 1280] },
   "1K (720p)":    { landscape: [1280, 720],  square: [1024, 1024], portrait: [720,  1280] },
   "1.3K (768p)":  { landscape: [1344, 768],  square: [1024, 1024], portrait: [768,  1344] },
   "2K (1080p)":   { landscape: [1920, 1080], square: [1536, 1536], portrait: [1080, 1920] },
