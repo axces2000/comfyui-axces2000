@@ -40,6 +40,50 @@ Load audio files into your ComfyUI workflow with a full-featured waveform interf
 
 ---
 
+### 🎧 Audio Player
+
+![Audio Player — Waveform](docs/audio_player_1waveform.png)
+
+A rich in-node audio monitor for listening to and analysing audio output from any upstream node. Receives a ComfyUI `AUDIO` input and displays four switchable visualisation modes, full transport controls, a stereo level meter, and a download menu. Created by **qualar**.
+
+**Visualisation modes** — cycle through them with the button in the bottom-right corner:
+
+| Mode | Screenshot |
+|------|-----------|
+| **Waveform** — stereo RMS bar display, left channel in purple, right in orange, playhead scrubbing | ![Waveform](docs/audio_player_1waveform.png) |
+| **Spectrum** — real-time FFT frequency plot with labelled Hz axis | ![Spectrum](docs/audio_player_2spectrum.png) |
+| **Analyzer** — stereo goniometer (phase/width scope) and stereo correlation meter | ![Analyzer](docs/audio_player_3analyzer.png) |
+| **Spectrogram** — psychoacoustic heatmap scrolling in real time | ![Spectrogram](docs/audio_player_4spectrogram.png) |
+
+**Transport controls**
+
+- Volume slider with mute button
+- Skip to start / skip to end
+- Play / Pause
+- Loop toggle
+
+**Download menu** — click the `⋮` button to export the audio:
+
+![Download menu](docs/audio_player_5save.png)
+
+- Download WAV (lossless, original quality)
+- Download MP3 at 128 / 192 / 320 kbps (encoded in-browser via lamejs — no server round-trip)
+- Download FLAC (lossless compressed, encoded server-side via soundfile)
+
+**Stats bar** — always visible above the waveform: sample rate, mono/stereo, and integrated LUFS loudness.
+
+**Inputs**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `audio` | AUDIO | Audio to monitor — connects from any node that outputs AUDIO |
+
+**Outputs**
+
+None — this is a terminal monitoring node.
+
+---
+
 ### 📐 Resolution Master
 
 ![Resolution Master](docs/resolution_master.png)
@@ -84,7 +128,7 @@ Extract individual lines from a multi-line text block by index, with automatic i
 - Live status bar showing current line preview and mode
 - Selected line is highlighted in the textarea
 - `text` and `index` can optionally be wired from upstream nodes
-- Works correctly across scheduled batch runs — state is tracked server-side
+- Works correctly across scheduled batch runs — advancement happens before each prompt is queued
 
 **How the index works**
 
@@ -121,7 +165,7 @@ The mode selector is disabled when the index is `0` or out of range.
 
 **Typical workflow pattern**
 
-Connect `index_out` back into `index` to create a self-advancing loop. Set mode to `Increment` and queue multiple runs — each run extracts the next line automatically.
+Set mode to `Increment` and queue multiple runs — each run extracts the next line automatically, starting from the displayed index value.
 
 ---
 
@@ -171,7 +215,8 @@ Then restart ComfyUI.
 
 - ComfyUI (any recent version)
 - `torchaudio` — for Audio Loader
-- `soundfile` — fallback audio backend (auto-installed)
+- `soundfile` — for Audio Loader (fallback backend) and Audio Player (FLAC export)
+- `scipy` — for Audio Player LUFS metering (optional, falls back to RMS if not present)
 
 ---
 
@@ -185,6 +230,11 @@ comfyui-axces2000/
 ├── Makefile
 ├── docs/
 │   ├── audio_loader.png
+│   ├── audio_player_1waveform.png
+│   ├── audio_player_2spectrum.png
+│   ├── audio_player_3analyzer.png
+│   ├── audio_player_4spectrogram.png
+│   ├── audio_player_5save.png
 │   ├── resolution_master.png
 │   ├── string_extractor.png
 │   └── string_combine.png
@@ -193,6 +243,11 @@ comfyui-axces2000/
 │   ├── audio_loader.py
 │   └── js/
 │       └── audio_loader.js
+├── audio_player/
+│   ├── __init__.py
+│   ├── audio_player_node.py
+│   └── js/
+│       └── audio_player_widget.js
 ├── resolution_master/
 │   ├── __init__.py
 │   ├── resolution_master.py
@@ -206,9 +261,18 @@ comfyui-axces2000/
 │   └── string_combine.py
 └── js/
     ├── audio_loader.js
+    ├── audio_player_widget.js
     ├── resolution_master.js
-    └── string_extractor.js
+    ├── string_extractor.js
+    └── lib/
+        └── lame.min.js
 ```
+
+---
+
+## Credits
+
+- **Audio Player** node created by [qualar](https://github.com/qualar)
 
 ---
 
