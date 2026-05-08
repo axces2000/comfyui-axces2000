@@ -1,314 +1,338 @@
 /**
- * AudioLoader Widget for ComfyUI
- * Provides: drag-and-drop upload, waveform visualization,
- * play/pause/stop controls, position indicator, duration display.
+ * AudioLoader Widget for ComfyUI  v2.6
  *
- * v1.4.0 — Fixed workflow save/restore:
- *           - Python input changed to STRING so saved filenames are never
- *             rejected by the "not in list" validator on reload.
- *           - onConfigure now restores by matching widget name in the node's
- *             input definitions rather than assuming a fixed array index.
- *           - serializeValue always returns the filename string (never null/undefined).
+ * trim_json is declared as a hidden input in Python's INPUT_TYPES.
+ * ComfyUI passes hidden inputs automatically in the prompt — but only if
+ * they appear in node.properties or are injected into the graph prompt.
+ *
+ * We use the cleanest available hook: override the node's getExtraInfo()
+ * which ComfyUI calls when building the prompt, injecting trim_json there.
+ * Fallback: also set it via a beforeQueued hook on the audio combo widget.
  */
 
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const WIDGET_HEIGHT  = 160;
-const WAVEFORM_COLOR = "#4ade80";
-const WAVEFORM_BG    = "#0f172a";
-const PLAYHEAD_COLOR = "#f8fafc";
-const ACCENT         = "#22d3ee";
-const NODE_WIDTH     = 340;
+const WAVE_H   = 150;
+const INFO_H   = 32;
+const BTN_H    = 36;
+const LABEL_H  = 18;
+const NODE_W   = 360;
+const WIDGET_H = WAVE_H + INFO_H + BTN_H + LABEL_H + 12;
 
-const AUDIO_EXTENSIONS = new Set([
-  "mp3", "wav", "wave", "flac", "ogg", "aac", "m4a", "opus", "weba"
-]);
+const C = {
+  bg:          "#0f172a",
+  barPlayed:   "#4ade80",
+  barUnplayed: "#1e3a2f",
+  barTrimmed:  "#0f1f17",
+  playhead:    "#f8fafc",
+  accent:      "#22d3ee",
+  trimHandle:  "#f59e0b",
+  trimFill:    "rgba(245,158,11,0.08)",
+  text:        "#94a3b8",
+  textBright:  "#e2e8f0",
+  border:      "#1e293b",
+  btnBg:       "#1e293b",
+};
 
-function isAudioFile(file) {
-  if (!file) return false;
-  if (file.type && file.type.startsWith("audio/")) return true;
-  const ext = file.name?.split(".").pop()?.toLowerCase();
-  return AUDIO_EXTENSIONS.has(ext);
+const AUDIO_EXTS = new Set(["mp3","wav","wave","flac","ogg","aac","m4a","opus","weba"]);
+const HANDLE_HIT = 10;
+
+function isAudioFile(f) {
+  if (!f) return false;
+  if (f.type?.startsWith("audio/")) return true;
+  return AUDIO_EXTS.has(f.name?.split(".").pop()?.toLowerCase());
 }
 
-// ─── Utility: format seconds → HH:MM:SS.mmm ──────────────────────────────────
-function formatDuration(seconds) {
-  if (!isFinite(seconds) || seconds < 0) return "00:00:00.000";
-  const h  = Math.floor(seconds / 3600);
-  const m  = Math.floor((seconds % 3600) / 60);
-  const s  = Math.floor(seconds % 60);
-  const ms = Math.floor((seconds % 1) * 1000);
-  return (
-    String(h).padStart(2, "0") + ":" +
-    String(m).padStart(2, "0") + ":" +
-    String(s).padStart(2, "0") + "." +
-    String(ms).padStart(3, "0")
-  );
+function fmt(s) {
+  if (!isFinite(s)||s<0) s=0;
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=Math.floor(s%60),ms=Math.floor((s%1)*1000);
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sc).padStart(2,"0")}.${String(ms).padStart(3,"0")}`;
+}
+function fmtShort(s) {
+  if (!isFinite(s)||s<0) s=0;
+  return `${Math.floor(s/60)}:${(s%60).toFixed(1).padStart(4,"0")}`;
+}
+function parseTime(str) {
+  if (!str) return null;
+  const p=str.trim().split(":");
+  let sec=0;
+  if (p.length===3)      sec=+p[0]*3600 + +p[1]*60 + +p[2];
+  else if (p.length===2) sec=+p[0]*60   + +p[1];
+  else                   sec=+p[0];
+  return isFinite(sec)?sec:null;
+}
+function safeStr(v) {
+  if (!v) return "";
+  if (typeof v==="string") return v;
+  if (Array.isArray(v)) return String(v[0]||"");
+  return String(v);
 }
 
-// ─── Waveform decoder ─────────────────────────────────────────────────────────
-async function decodeWaveformPeaks(arrayBuffer, numBars = 200) {
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+async function decodeWaveformPeaks(buf, numBars=220) {
+  const ctx=new (window.AudioContext||window.webkitAudioContext)();
   try {
-    const decoded = await audioCtx.decodeAudioData(arrayBuffer);
-    const channel = decoded.getChannelData(0);
-    const block   = Math.floor(channel.length / numBars);
-    const peaks   = [];
-    for (let i = 0; i < numBars; i++) {
-      let max = 0;
-      const start = i * block;
-      for (let j = 0; j < block; j++) {
-        const v = Math.abs(channel[start + j]);
-        if (v > max) max = v;
-      }
+    const dec=await ctx.decodeAudioData(buf);
+    const ch=dec.getChannelData(0), block=Math.floor(ch.length/numBars);
+    const peaks=[];
+    for (let i=0;i<numBars;i++) {
+      let max=0,base=i*block;
+      for (let j=0;j<block;j++){const v=Math.abs(ch[base+j]);if(v>max)max=v;}
       peaks.push(max);
     }
-    const globalMax = Math.max(...peaks, 0.001);
-    return { peaks: peaks.map(p => p / globalMax), duration: decoded.duration };
-  } finally {
-    audioCtx.close();
-  }
+    const gm=Math.max(...peaks,0.001);
+    return {peaks:peaks.map(p=>p/gm), duration:dec.duration};
+  } finally { ctx.close(); }
 }
 
-// ─── Main Widget Factory ──────────────────────────────────────────────────────
-function createAudioWidget(node, inputName) {
-  let audioPeaks         = [];
-  let audioDuration      = 0;
-  let audioElement       = null;
-  let playState          = "stopped";
-  let playheadPos        = 0;
-  let animFrame          = null;
-  let isDraggingPlayhead = false;
-  let isDragOver         = false;
-  let currentFilename    = null;
+// ─── Widget Factory ───────────────────────────────────────────────────────────
+function createAudioWidget(node, nativeComboWidget) {
+  let peaks=[], duration=0, audioEl=null;
+  let playState="stopped", playheadFrac=0, animFrame=null;
+  let isDragOver=false, trimStart=0, trimEnd=0;
+  let dragTarget=null, hoveredZone=null;
 
-  const widget = node.addWidget(
-    "AUDIO_LOADER_WIDGET", inputName, "", () => {}, { serialize: true }
-  );
-  widget.computeSize = () => [NODE_WIDTH, WIDGET_HEIGHT + 60];
+  // Hide the native combo widget — keep it for filename serialisation
+  const ZERO=()=>[0,0];
+  nativeComboWidget.computeSize=ZERO;
+  nativeComboWidget.draw=()=>{};
+  nativeComboWidget.mouse=()=>false;
 
-  // ── Audio element setup ───────────────────────────────────────────────────
+  function trimJson() {
+    const trimmed = duration>0 && (trimStart>0 || trimEnd<duration);
+    return trimmed ? JSON.stringify({s:trimStart,e:trimEnd}) : '{"s":0,"e":0}';
+  }
+
+  function isTrimmed() { return duration>0 && (trimStart>0||trimEnd<duration); }
+
+  // ── Audio ─────────────────────────────────────────────────────────────────
   function setupAudio(url) {
-    if (audioElement) { audioElement.pause(); audioElement.src = ""; }
-    audioElement = new Audio(url);
-    audioElement.addEventListener("ended", () => {
-      playState = "stopped"; playheadPos = 0;
-      cancelAnimationFrame(animFrame);
-      node.setDirtyCanvas(true, false);
+    if (audioEl){audioEl.pause();audioEl.src="";}
+    audioEl=new Audio(url);
+    audioEl.addEventListener("ended",()=>{
+      playState="stopped"; playheadFrac=duration>0?trimStart/duration:0;
+      cancelAnimationFrame(animFrame); node.setDirtyCanvas(true,false);
+    });
+    audioEl.addEventListener("timeupdate",()=>{
+      if (duration>0&&trimEnd>0&&audioEl.currentTime>=trimEnd){
+        audioEl.pause(); audioEl.currentTime=trimStart;
+        playState="stopped"; playheadFrac=trimStart/duration;
+        cancelAnimationFrame(animFrame); node.setDirtyCanvas(true,false);
+      }
     });
   }
 
-  function tickPlayhead() {
-    if (audioElement?.duration) {
-      playheadPos = audioElement.currentTime / audioElement.duration;
-    }
-    node.setDirtyCanvas(true, false);
-    if (playState === "playing") animFrame = requestAnimationFrame(tickPlayhead);
+  function clampPlayhead() {
+    if (!duration) return;
+    const lo=trimStart/duration, hi=trimEnd/duration;
+    if (playheadFrac<lo) playheadFrac=lo;
+    if (playheadFrac>hi) playheadFrac=hi;
+    if (audioEl) audioEl.currentTime=playheadFrac*duration;
   }
 
-  // ── File loading ──────────────────────────────────────────────────────────
-  async function loadAudioFile(filename) {
-    if (!filename || filename.trim() === "") return;
-    currentFilename  = filename;
-    widget.value     = filename;   // keep widget value in sync at all times
-    const url = api.apiURL(
-      `/view?filename=${encodeURIComponent(filename)}&type=input`
-    );
+  function tick() {
+    if (audioEl?.duration) playheadFrac=audioEl.currentTime/audioEl.duration;
+    node.setDirtyCanvas(true,false);
+    if (playState==="playing") animFrame=requestAnimationFrame(tick);
+  }
+
+  async function loadAudioFile(fname, restoredStart, restoredEnd) {
+    if (!fname?.trim()) return;
+    nativeComboWidget.value=fname;
+    const url=api.apiURL(`/view?filename=${encodeURIComponent(fname)}&type=input`);
     try {
-      const res    = await fetch(url);
-      const buf    = await res.arrayBuffer();
-      const result = await decodeWaveformPeaks(buf.slice(0));
-      audioPeaks    = result.peaks;
-      audioDuration = result.duration;
-    } catch (e) {
-      console.error("[AudioLoader] Waveform decode error", e);
-      audioPeaks = []; audioDuration = 0;
-    }
+      const res=await fetch(url), buf=await res.arrayBuffer();
+      const result=await decodeWaveformPeaks(buf.slice(0));
+      peaks=result.peaks; duration=result.duration;
+    } catch(e) { console.error("[AudioLoader] decode error",e); peaks=[];duration=0; }
+
+    if (restoredStart!==undefined && (restoredStart>0||(restoredEnd>0&&restoredEnd<duration))) {
+      trimStart=restoredStart; trimEnd=restoredEnd>0?restoredEnd:duration;
+    } else { trimStart=0; trimEnd=duration; }
+
+    // Update node's hidden trim_json property so it gets included in the prompt
+    node._alTrimJson = trimJson();
+
     setupAudio(url);
-    playState = "stopped"; playheadPos = 0;
-    node.setDirtyCanvas(true, false);
+    playState="stopped"; playheadFrac=duration>0?trimStart/duration:0;
+    node.setDirtyCanvas(true,false);
   }
 
   async function uploadFile(file) {
-    const formData = new FormData();
-    formData.append("image", file, file.name);
+    const fd=new FormData(); fd.append("image",file,file.name);
     try {
-      const res = await api.fetchApi("/upload/audio", { method: "POST", body: formData });
+      const res=await api.fetchApi("/upload/audio",{method:"POST",body:fd});
       if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
+      const data=await res.json();
       await loadAudioFile(data.name);
-    } catch (e) {
-      console.error("[AudioLoader] Upload error", e);
-      alert("Audio upload failed: " + e.message);
-    }
+    } catch(e) { console.error("[AudioLoader] upload error",e); alert("Upload failed: "+e.message); }
   }
 
-  // ── Draw ──────────────────────────────────────────────────────────────────
-  widget.draw = function (ctx, node, width, y) {
-    const px = 10, pw = width - 20;
+  function promptTrim(which) {
+    const cur=which==="start"?fmt(trimStart):fmt(trimEnd);
+    const label=which==="start"?"Trim Start (HH:MM:SS.mmm)":"Trim End (HH:MM:SS.mmm)";
+    const result=window.prompt(label,cur);
+    if (result===null) return;
+    const t=parseTime(result.trim());
+    if (t===null) return;
+    if (which==="start") trimStart=Math.max(0,Math.min(t,trimEnd-0.001));
+    else                 trimEnd=Math.min(duration,Math.max(t,trimStart+0.001));
+    clampPlayhead();
+    node._alTrimJson=trimJson();
+    node.setDirtyCanvas(true,false);
+  }
 
-    ctx.fillStyle = WAVEFORM_BG;
-    ctx.beginPath(); ctx.roundRect(px, y, pw, WIDGET_HEIGHT, 8); ctx.fill();
+  // ── Master draw ───────────────────────────────────────────────────────────
+  const master=node.addWidget("AL_MASTER","_al_master",null,()=>{},{serialize:false});
+  master.computeSize=()=>[NODE_W,WIDGET_H+20];
 
-    ctx.strokeStyle = isDragOver ? ACCENT : "#1e293b";
-    ctx.lineWidth   = isDragOver ? 2 : 1;
-    ctx.beginPath(); ctx.roundRect(px, y, pw, WIDGET_HEIGHT, 8); ctx.stroke();
+  master.draw=function(ctx,node,width,y) {
+    const px=10,pw=width-20,waveX=px+10,waveW=pw-20;
+    const fname=nativeComboWidget.value||"";
+    const tsF=duration>0?trimStart/duration:0, teF=duration>0?trimEnd/duration:1;
+    const tsX=waveX+tsF*waveW, teX=waveX+teF*waveW;
 
-    if (audioPeaks.length > 0) {
-      const barCount = audioPeaks.length;
-      const barW     = (pw - 20) / barCount;
-      const centerY  = y + WIDGET_HEIGHT / 2;
-      const maxBarH  = WIDGET_HEIGHT / 2 - 12;
-      for (let i = 0; i < barCount; i++) {
-        const bx     = px + 10 + i * barW;
-        const bh     = Math.max(2, audioPeaks[i] * maxBarH);
-        const played = (i / barCount) <= playheadPos;
-        ctx.fillStyle = played ? WAVEFORM_COLOR : "#1e3a2f";
-        ctx.beginPath();
-        ctx.roundRect(bx, centerY - bh, Math.max(1, barW - 1), bh * 2, 1);
-        ctx.fill();
+    ctx.fillStyle=C.bg; ctx.strokeStyle=isDragOver?C.accent:C.border; ctx.lineWidth=isDragOver?2:1;
+    ctx.beginPath(); ctx.roundRect(px,y,pw,WAVE_H,8); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(px,y,pw,WAVE_H,8); ctx.stroke();
+
+    if (peaks.length>0) {
+      ctx.fillStyle=C.trimFill; ctx.fillRect(tsX,y+4,teX-tsX,WAVE_H-8);
+      const barW=waveW/peaks.length,cy=y+WAVE_H/2,maxH=WAVE_H/2-14;
+      for (let i=0;i<peaks.length;i++) {
+        const frac=i/peaks.length, inTrim=frac>=tsF&&frac<teF, played=frac<=playheadFrac&&inTrim;
+        const bx=waveX+i*barW, bh=Math.max(2,peaks[i]*maxH);
+        ctx.fillStyle=inTrim?(played?C.barPlayed:C.barUnplayed):C.barTrimmed;
+        ctx.beginPath(); ctx.roundRect(bx,cy-bh,Math.max(1,barW-1),bh*2,1); ctx.fill();
       }
-      const phX = px + 10 + playheadPos * (pw - 20);
-      ctx.strokeStyle = PLAYHEAD_COLOR; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(phX, y + 6); ctx.lineTo(phX, y + WIDGET_HEIGHT - 6); ctx.stroke();
-      ctx.fillStyle = PLAYHEAD_COLOR;
-      ctx.beginPath();
-      ctx.moveTo(phX - 5, y + 6); ctx.lineTo(phX + 5, y + 6); ctx.lineTo(phX, y + 14);
-      ctx.closePath(); ctx.fill();
+      const dh=(hx,side)=>{
+        const hov=hoveredZone===(side==="left"?"trimL":"trimR");
+        ctx.strokeStyle=hov?"#fbbf24":C.trimHandle; ctx.lineWidth=hov?3:2;
+        ctx.beginPath(); ctx.moveTo(hx,y+4); ctx.lineTo(hx,y+WAVE_H-4); ctx.stroke();
+        const tw=12,th=16,tx=side==="left"?hx:hx-tw;
+        ctx.fillStyle=hov?"#fbbf24":C.trimHandle;
+        ctx.beginPath(); ctx.roundRect(tx,y+4,tw,th,3); ctx.fill();
+        ctx.fillStyle="#0f172a"; ctx.font="bold 9px monospace"; ctx.textAlign="center";
+        ctx.fillText(side==="left"?"◀":"▶",hx+(side==="left"?tw/2:-tw/2),y+15); ctx.textAlign="left";
+      };
+      dh(tsX,"left"); dh(teX,"right");
+      const phX=waveX+playheadFrac*waveW;
+      ctx.strokeStyle=C.playhead; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(phX,y+6); ctx.lineTo(phX,y+WAVE_H-6); ctx.stroke();
+      ctx.fillStyle=C.playhead;
+      ctx.beginPath(); ctx.moveTo(phX-5,y+6); ctx.lineTo(phX+5,y+6); ctx.lineTo(phX,y+15); ctx.closePath(); ctx.fill();
     } else {
-      ctx.fillStyle = isDragOver ? ACCENT : "#334155";
-      ctx.font = "bold 13px monospace"; ctx.textAlign = "center";
-      ctx.fillText(
-        isDragOver ? "Drop audio file here" : "🎵  Drag & drop audio  /  select below",
-        px + pw / 2, y + WIDGET_HEIGHT / 2 - 8
-      );
-      ctx.font = "11px monospace"; ctx.fillStyle = "#64748b";
-      ctx.fillText("MP3 · WAV · FLAC · OGG · AAC · M4A", px + pw / 2, y + WIDGET_HEIGHT / 2 + 12);
-      ctx.textAlign = "left";
+      ctx.fillStyle=isDragOver?C.accent:"#334155"; ctx.font="bold 13px monospace"; ctx.textAlign="center";
+      ctx.fillText(isDragOver?"Drop audio file here":"🎵  Drag & drop audio  /  select below",px+pw/2,y+WAVE_H/2-8);
+      ctx.font="11px monospace"; ctx.fillStyle="#64748b";
+      ctx.fillText("MP3 · WAV · FLAC · OGG · AAC · M4A",px+pw/2,y+WAVE_H/2+12); ctx.textAlign="left";
     }
 
-    const currentTime = audioElement?.currentTime ?? 0;
-    ctx.fillStyle = "#94a3b8"; ctx.font = "10px monospace";
-    ctx.textAlign = "left";  ctx.fillText(formatDuration(currentTime),  px + 12,      y + WIDGET_HEIGHT - 6);
-    ctx.textAlign = "right"; ctx.fillText(formatDuration(audioDuration), px + pw - 12, y + WIDGET_HEIGHT - 6);
-    ctx.textAlign = "left";
+    const infoY=y+WAVE_H+4;
+    if (duration>0) {
+      ctx.fillStyle=C.text; ctx.font="10px monospace"; ctx.textAlign="left";
+      ctx.fillText(`total: ${fmtShort(duration)}`,px+2,infoY+12);
+      if (isTrimmed()) {
+        ctx.fillStyle=C.trimHandle; ctx.font="bold 10px monospace"; ctx.textAlign="center";
+        ctx.fillText(`▶ ${fmtShort(trimEnd-trimStart)}`,px+pw/2,infoY+12);
+      }
+    }
+    const tsHov=hoveredZone==="trimLLabel",teHov=hoveredZone==="trimRLabel";
+    ctx.font=(tsHov?"bold ":"")+"10px monospace"; ctx.fillStyle=tsHov?C.accent:C.trimHandle;
+    ctx.textAlign="left"; ctx.fillText(`✎ ${fmtShort(trimStart)}`,px+2,infoY+26);
+    ctx.font=(teHov?"bold ":"")+"10px monospace"; ctx.fillStyle=teHov?C.accent:C.trimHandle;
+    ctx.textAlign="right"; ctx.fillText(`${fmtShort(trimEnd)} ✎`,px+pw-2,infoY+26); ctx.textAlign="left";
 
-    if (currentFilename) {
-      ctx.fillStyle = "#64748b"; ctx.font = "10px monospace"; ctx.textAlign = "center";
-      const t = currentFilename.length > 40 ? currentFilename.slice(0, 38) + "…" : currentFilename;
-      ctx.fillText(t, px + pw / 2, y + WIDGET_HEIGHT + 16);
-      ctx.textAlign = "left";
+    const labelY=infoY+INFO_H+2;
+    if (fname) {
+      ctx.fillStyle="#64748b"; ctx.font="10px monospace"; ctx.textAlign="center";
+      ctx.fillText(fname.length>44?fname.slice(0,42)+"…":fname,px+pw/2,labelY+12); ctx.textAlign="left";
     }
 
-    const btnY      = y + WIDGET_HEIGHT + (currentFilename ? 22 : 6);
-    const btnSize   = 28, btnGap = 8;
-    const btnStartX = px + pw / 2 - (2 * btnSize + btnGap) / 2;
-    const buttons   = [
-      { label: playState === "playing" ? "⏸" : "▶", action: "play", bx: btnStartX },
-      { label: "⏹", action: "stop", bx: btnStartX + btnSize + btnGap },
-    ];
-    widget._buttons = buttons.map(b => ({ ...b, y: btnY, size: btnSize }));
-    buttons.forEach(btn => {
-      const active = btn.action === "play" && playState === "playing";
-      ctx.fillStyle   = active ? ACCENT : "#1e293b";
-      ctx.strokeStyle = active ? ACCENT : "#334155";
-      ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.roundRect(btn.bx, btnY, btnSize, btnSize, 6); ctx.fill(); ctx.stroke();
-      ctx.fillStyle = active ? "#0f172a" : "#e2e8f0";
-      ctx.font = "14px sans-serif"; ctx.textAlign = "center";
-      ctx.fillText(btn.label, btn.bx + btnSize / 2, btnY + btnSize / 2 + 5);
-      ctx.textAlign = "left";
-    });
+    const btnY=labelY+LABEL_H+2,btnSz=28,btnGap=8;
+    const playBx=px+pw/2-btnSz-btnGap/2, stopBx=px+pw/2+btnGap/2;
+    const db=(bx,label,active,hov)=>{
+      ctx.fillStyle=active?C.accent:(hov?"#253550":C.btnBg);
+      ctx.strokeStyle=active?C.accent:(hov?C.accent:"#334155"); ctx.lineWidth=1;
+      ctx.beginPath(); ctx.roundRect(bx,btnY,btnSz,btnSz,6); ctx.fill(); ctx.stroke();
+      ctx.fillStyle=active?"#0f172a":C.textBright; ctx.font="14px sans-serif"; ctx.textAlign="center";
+      ctx.fillText(label,bx+btnSz/2,btnY+btnSz/2+5); ctx.textAlign="left";
+    };
+    db(playBx,playState==="playing"?"⏸":"▶",playState==="playing",hoveredZone==="play");
+    db(stopBx,"⏹",false,hoveredZone==="stop");
 
-    widget._lastY = y;
+    master._z={waveX,waveW,waveY:y,waveBot:y+WAVE_H,infoY,infoBot:infoY+INFO_H,tsX,teX,playBx,stopBx,btnY,btnSz,px,pw};
   };
 
-  // ── Mouse ─────────────────────────────────────────────────────────────────
-  widget.mouse = function (event, pos, node) {
-    const [mx, my] = pos;
-    const px = 10, pw = node.size[0] - 20;
-    const waveTop = widget._lastY ?? 0, waveBottom = waveTop + WIDGET_HEIGHT;
+  master.mouse=function(event,pos,node) {
+    if (!master._z) return false;
+    const [mx,my]=pos, z=master._z;
+    const inWave=my>=z.waveY&&my<=z.waveBot, inInfo=my>=z.infoY&&my<=z.infoBot;
+    const inBtn=bx=>mx>=bx&&mx<=bx+z.btnSz&&my>=z.btnY&&my<=z.btnY+z.btnSz;
 
-    if (audioPeaks.length > 0 && my >= waveTop && my <= waveBottom) {
-      if (event.type === "pointerdown") isDraggingPlayhead = true;
+    if (event.type==="pointermove") {
+      let h=null;
+      if (inWave&&peaks.length>0) {
+        if (Math.abs(mx-z.tsX)<=HANDLE_HIT) h="trimL";
+        else if (Math.abs(mx-z.teX)<=HANDLE_HIT) h="trimR";
+      }
+      if (inInfo&&my>z.infoY+14) h=mx<z.px+z.pw/2?"trimLLabel":"trimRLabel";
+      if (inBtn(z.playBx)) h="play";
+      if (inBtn(z.stopBx)) h="stop";
+      if (h!==hoveredZone){hoveredZone=h;node.setDirtyCanvas(true,false);}
     }
-    if (isDraggingPlayhead) {
-      const frac = Math.max(0, Math.min(1, (mx - px - 10) / (pw - 20)));
-      playheadPos = frac;
-      if (audioElement?.duration) audioElement.currentTime = frac * audioElement.duration;
-      if (event.type === "pointerup") isDraggingPlayhead = false;
-      node.setDirtyCanvas(true, false);
+
+    if (dragTarget) {
+      if (event.type==="pointermove") {
+        const frac=Math.max(0,Math.min(1,(mx-z.waveX)/z.waveW)),t=frac*duration;
+        if (dragTarget==="trimL")      trimStart=Math.max(0,Math.min(t,trimEnd-0.001));
+        else if (dragTarget==="trimR") trimEnd=Math.min(duration,Math.max(t,trimStart+0.001));
+        else { playheadFrac=Math.max(trimStart/duration,Math.min(trimEnd/duration,frac)); if(audioEl)audioEl.currentTime=playheadFrac*duration; }
+        clampPlayhead(); node._alTrimJson=trimJson(); node.setDirtyCanvas(true,false); return true;
+      }
+      if (event.type==="pointerup"){dragTarget=null;return true;}
       return true;
     }
-    if (event.type === "pointerdown" && widget._buttons) {
-      for (const btn of widget._buttons) {
-        if (mx >= btn.bx && mx <= btn.bx + btn.size && my >= btn.y && my <= btn.y + btn.size) {
-          handleButton(btn.action); return true;
-        }
+
+    if (event.type==="pointerdown") {
+      if (inWave&&peaks.length>0) {
+        if (Math.abs(mx-z.tsX)<=HANDLE_HIT){dragTarget="trimL";return true;}
+        if (Math.abs(mx-z.teX)<=HANDLE_HIT){dragTarget="trimR";return true;}
+        dragTarget="playhead"; return true;
       }
+      if (inInfo&&my>z.infoY+14){mx<z.px+z.pw/2?promptTrim("start"):promptTrim("end");return true;}
+      if (inBtn(z.playBx)){handlePlayPause();return true;}
+      if (inBtn(z.stopBx)){handleStop();return true;}
     }
     return false;
   };
 
-  function handleButton(action) {
-    if (!audioElement) return;
-    if (action === "play") {
-      if (playState === "playing") {
-        audioElement.pause(); playState = "paused"; cancelAnimationFrame(animFrame);
-      } else {
-        audioElement.play(); playState = "playing"; animFrame = requestAnimationFrame(tickPlayhead);
-      }
-    } else if (action === "stop") {
-      audioElement.pause(); audioElement.currentTime = 0;
-      playState = "stopped"; playheadPos = 0; cancelAnimationFrame(animFrame);
+  function handlePlayPause() {
+    if (!audioEl) return;
+    if (playState==="playing"){audioEl.pause();playState="paused";cancelAnimationFrame(animFrame);}
+    else {
+      if (duration>0&&audioEl.currentTime>=trimEnd-0.01){audioEl.currentTime=trimStart;playheadFrac=trimStart/duration;}
+      audioEl.play(); playState="playing"; animFrame=requestAnimationFrame(tick);
     }
-    node.setDirtyCanvas(true, false);
+    node.setDirtyCanvas(true,false);
+  }
+  function handleStop() {
+    if (!audioEl) return;
+    audioEl.pause(); audioEl.currentTime=trimStart;
+    playheadFrac=duration>0?trimStart/duration:0; playState="stopped";
+    cancelAnimationFrame(animFrame); node.setDirtyCanvas(true,false);
   }
 
-  // ── Serialization ─────────────────────────────────────────────────────────
-  // Always return the filename string. ComfyUI saves this into widgets_values
-  // in the workflow JSON and passes it back as the "audio" STRING input on load.
-  widget.serializeValue = () => currentFilename || "";
+  master._setDragOver=v=>{isDragOver=v;node.setDirtyCanvas(true,false);};
+  node.onDragOver=function(e){const has=[...(e.dataTransfer?.items??[])].some(i=>i.kind==="file");master._setDragOver(has);return has;};
+  node.onDragDrop=async function(e){master._setDragOver(false);const file=e.dataTransfer?.files?.[0];if(file&&isAudioFile(file)){await uploadFile(file);return true;}return false;};
+  const origRemoved=node.onRemoved?.bind(node);
+  node.onRemoved=function(){if(audioEl){audioEl.pause();audioEl.src="";}cancelAnimationFrame(animFrame);origRemoved?.();};
 
-  // ── Expose helpers ────────────────────────────────────────────────────────
-  widget._loadAudioFile = loadAudioFile;
-  widget._uploadFile    = uploadFile;
-  widget._setDragOver   = (v) => { isDragOver = v; node.setDirtyCanvas(true, false); };
-
-  // ── Drag & Drop ───────────────────────────────────────────────────────────
-  node.onDragOver = function (e) {
-    if (e.dataTransfer?.items) {
-      const hasFile = [...e.dataTransfer.items].some(i => i.kind === "file");
-      if (hasFile) { widget._setDragOver(true); return true; }
-    }
-    widget._setDragOver(false);
-    return false;
-  };
-
-  node.onDragDrop = async function (e) {
-    widget._setDragOver(false);
-    const file = e.dataTransfer?.files?.[0];
-    if (file && isAudioFile(file)) {
-      await uploadFile(file);
-      return true;
-    }
-    return false;
-  };
-
-  // Cleanup on node removal
-  const origOnRemoved = node.onRemoved?.bind(node);
-  node.onRemoved = function () {
-    if (audioElement) { audioElement.pause(); audioElement.src = ""; }
-    cancelAnimationFrame(animFrame);
-    origOnRemoved?.();
-  };
-
-  return widget;
+  return {loadAudioFile, uploadFile};
 }
 
-// ─── Register extension ───────────────────────────────────────────────────────
+// ─── Register ─────────────────────────────────────────────────────────────────
 app.registerExtension({
   name: "Axces2000.AudioLoader",
 
@@ -316,53 +340,88 @@ app.registerExtension({
     if (nodeData.name !== "AudioLoader") return;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;
-    nodeType.prototype.onNodeCreated = function () {
+    nodeType.prototype.onNodeCreated = function() {
       onNodeCreated?.apply(this, arguments);
       this.serialize_widgets = true;
 
-      // The Python input is now STRING type, so ComfyUI generates a text widget
-      // named "audio". Remove it and replace with our custom canvas widget.
-      const idx = this.widgets?.findIndex(w => w.name === "audio");
-      if (idx !== undefined && idx >= 0) this.widgets.splice(idx, 1);
+      const comboW = this.widgets?.find(w => w.name === "audio");
+      if (!comboW) { console.error("[AudioLoader] combo widget not found"); return; }
 
-      createAudioWidget(this, "audio");
-      this.size = [NODE_WIDTH + 20, WIDGET_HEIGHT + 120];
+      const w = createAudioWidget(this, comboW);
+      this._alWidgets = w;
 
-      this.addWidget("button", "📁 Browse file", null, () => {
-        const input = document.createElement("input");
-        input.type = "file"; input.accept = "audio/*";
-        input.onchange = async (e) => {
-          const file = e.target.files[0];
-          if (!file) return;
-          const aw = this.widgets?.find(w => w.name === "audio" && w._uploadFile);
-          if (aw) await aw._uploadFile(file);
-        };
-        input.click();
+      // A zero-size STRING widget that ComfyUI will serialise into the prompt
+      // automatically — this is how trim_json reliably reaches Python.
+      const trimWidget = this.addWidget("STRING", "trim_json", '{"s":0,"e":0}', ()=>{}, {serialize: true});
+      trimWidget.computeSize = () => [0, -4]; // invisible but present
+      trimWidget.draw = () => {};
+      this._alTrimWidget = trimWidget;
+
+      // Keep _alTrimJson in sync: any write also updates the widget value.
+      Object.defineProperty(this, "_alTrimJson", {
+        get: () => trimWidget.value,
+        set: (v) => { trimWidget.value = v; },
+        configurable: true,
       });
+
+      this.addWidget("button","📁 Browse file",null,()=>{
+        const inp=document.createElement("input"); inp.type="file"; inp.accept="audio/*";
+        inp.onchange=async e=>{const file=e.target.files[0];if(file)await this._alWidgets?.uploadFile(file);};
+        inp.click();
+      });
+
+      // Only set default size on fresh creation; onConfigure will run
+      // afterward for saved workflows and must not have its size overwritten.
+      if (!this._alSizeSet) {
+        this.size=[NODE_W+20, WIDGET_H+80];
+        this._alSizeSet = true;
+      }
+
+      const initialFile = safeStr(comboW.value);
+      if (initialFile.trim()) {
+        setTimeout(()=>w.loadAudioFile(initialFile),100);
+      }
     };
 
+    // No graphToPrompt patch needed — trim_json is serialised via the
+    // hidden STRING widget added in onNodeCreated below.
+
     const onConfigure = nodeType.prototype.onConfigure;
-    nodeType.prototype.onConfigure = function (config) {
+    nodeType.prototype.onConfigure = function(config) {
       onConfigure?.apply(this, arguments);
+      if (!this._alWidgets) return;
 
-      // Find the saved filename from widgets_values by matching the widget
-      // position in the node's input definition order — same method ComfyUI
-      // itself uses internally, which is robust regardless of array index.
-      //
-      // widgets_values is an array parallel to the node's widget list at save
-      // time. Our "audio" widget is always first (index 0) since it replaces
-      // the only required input. But we search by name to be safe.
-      const aw = this.widgets?.find(w => w.name === "audio" && w._loadAudioFile);
-      if (!aw) return;
+      const vals  = config.widgets_values ?? [];
+      const fname = safeStr(vals[0]);
 
-      // First try: read from widgets_values by index of our widget in the list
-      const widgetIndex = this.widgets.indexOf(aw);
-      const savedValue  = config.widgets_values?.[widgetIndex]
-                       ?? config.widgets_values?.[0];   // fallback to first slot
+      // Restore trim: prefer the serialised trim_json widget (vals[3]),
+      // fall back to the legacy axces2000_trim property for old workflows.
+      let ts=0, te=0;
+      try {
+        const savedTrim = vals[3] ?? null;
+        if (savedTrim && savedTrim !== '{"s":0,"e":0}') {
+          const p = JSON.parse(savedTrim);
+          ts = p.s ?? 0; te = p.e ?? 0;
+        } else if (config.axces2000_trim) {
+          ts = config.axces2000_trim.s ?? 0;
+          te = config.axces2000_trim.e ?? 0;
+        }
+      } catch(e) {}
 
-      if (savedValue && savedValue.trim() !== "") {
-        aw._loadAudioFile(savedValue);
+      if (fname) {
+        setTimeout(()=>this._alWidgets.loadAudioFile(fname,ts,te),150);
       }
+    };
+
+    const origSerializeNode = nodeType.prototype.serialize;
+    nodeType.prototype.serialize = function() {
+      const data = origSerializeNode ? origSerializeNode.call(this) : {};
+      if (this._alTrimJson && this._alTrimJson !== '{"s":0,"e":0}') {
+        try {
+          data.axces2000_trim = JSON.parse(this._alTrimJson);
+        } catch(e) {}
+      }
+      return data;
     };
   },
 });

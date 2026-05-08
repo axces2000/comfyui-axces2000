@@ -1,10 +1,9 @@
 import os
+import json
 import folder_paths
 
-# Register audio file types with ComfyUI's path system
 audio_extensions = ["mp3", "wav", "flac", "ogg", "aac", "m4a", "opus"]
 
-# Add audio input directory to folder_paths
 if "audio" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["audio"] = (
         [os.path.join(folder_paths.base_path, "input")],
@@ -13,207 +12,166 @@ if "audio" not in folder_paths.folder_names_and_paths:
 
 
 class AudioLoaderNode:
-    """
-    A ComfyUI node for loading audio files with a rich waveform UI.
-    Outputs audio tensor, sample rate, duration, and metadata.
-    """
 
     @classmethod
     def INPUT_TYPES(cls):
-        # STRING instead of a dynamic combo list.
-        # A dynamic list causes validation failure on workflow restore when
-        # the list is empty or not yet refreshed — the saved filename gets
-        # rejected as "not in list". STRING accepts any value unconditionally.
+        audio_files = folder_paths.get_filename_list("audio")
         return {
             "required": {
-                "audio": ("STRING", {"default": ""}),
+                "audio": (sorted(audio_files),),
             },
             "optional": {
                 "normalize": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {
+                # trim_json is written by the JS widget and passed here.
+                # Using "hidden" means: no widget created, value always sent.
+                "trim_json": ("STRING", {"default": '{"s":0,"e":0}'}),
+                "unique_id": "UNIQUE_ID",
             }
         }
 
     RETURN_TYPES = ("AUDIO", "INT", "FLOAT", "STRING")
     RETURN_NAMES = ("audio", "sample_rate", "duration_seconds", "metadata")
-    FUNCTION = "load_audio"
-    CATEGORY = "audio"
-    OUTPUT_NODE = False
+    FUNCTION     = "load_audio"
+    CATEGORY     = "audio"
+    OUTPUT_NODE  = False
 
-    def _load_waveform(self, audio_path: str):
-        """
-        Load audio with a robust multi-backend fallback.
-        Handles torchaudio >= 2.9 (torchcodec-based) and older versions.
-        Also works on Windows where torchcodec is unavailable.
-        """
+    def _load_waveform(self, audio_path):
         last_error = None
-
-        # Strategy 1: torchcodec directly (torchaudio >= 2.9, Linux/Mac)
         try:
             from torchcodec.decoders import AudioDecoder
-            decoder = AudioDecoder(audio_path)
-            samples = decoder.get_all_samples()
-            waveform = samples.data
-            sample_rate = samples.sample_rate
-            return waveform, sample_rate
-        except Exception as e:
-            last_error = e
-
-        # Strategy 2: torchaudio with explicit soundfile backend
+            dec = AudioDecoder(audio_path); s = dec.get_all_samples()
+            return s.data, s.sample_rate
+        except Exception as e: last_error = e
         try:
             import torchaudio
-            waveform, sample_rate = torchaudio.load(audio_path, backend="soundfile")
-            return waveform, sample_rate
-        except Exception as e:
-            last_error = e
-
-        # Strategy 3: torchaudio with ffmpeg backend
+            return torchaudio.load(audio_path, backend="soundfile")
+        except Exception as e: last_error = e
         try:
             import torchaudio
-            waveform, sample_rate = torchaudio.load(audio_path, backend="ffmpeg")
-            return waveform, sample_rate
-        except Exception as e:
-            last_error = e
-
-        # Strategy 4: plain torchaudio.load() — any version, any backend
+            return torchaudio.load(audio_path, backend="ffmpeg")
+        except Exception as e: last_error = e
         try:
             import torchaudio
-            waveform, sample_rate = torchaudio.load(audio_path)
-            return waveform, sample_rate
-        except Exception as e:
-            last_error = e
-
-        # Strategy 5: soundfile directly — tiny pure-Python fallback
+            return torchaudio.load(audio_path)
+        except Exception as e: last_error = e
         try:
-            import soundfile as sf
-            import torch
-            data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
-            waveform = torch.from_numpy(data.T)  # [channels, time]
-            return waveform, sample_rate
-        except Exception as e:
-            last_error = e
+            import soundfile as sf, torch
+            data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+            return torch.from_numpy(data.T), sr
+        except Exception as e: last_error = e
+        raise RuntimeError(f"Could not load audio. Last error: {last_error}")
 
-        raise RuntimeError(
-            f"Could not load audio '{audio_path}' with any available backend. "
-            f"Last error: {last_error}\n"
-            f"Try: pip install torchcodec  OR  pip install soundfile"
-        )
-
-    def load_audio(self, audio, normalize=False):
-        if not audio or audio.strip() == "":
-            raise ValueError("No audio file selected. Please upload or select an audio file.")
-
-        # Resolve to absolute path — handles both plain filenames and
-        # annotated paths (e.g. "filename [subfolder/type]") that ComfyUI may produce.
+    def load_audio(self, audio, normalize=False,
+                   trim_json='{"s":0,"e":0}', unique_id="0"):
         audio_path = folder_paths.get_annotated_filepath(audio)
-
-        # If not found via annotation, try resolving directly in the input dir
         if not os.path.exists(audio_path):
-            input_dir = folder_paths.get_input_directory()
-            candidate = os.path.join(input_dir, os.path.basename(audio))
-            if os.path.exists(candidate):
-                audio_path = candidate
-            else:
-                raise FileNotFoundError(
-                    f"Audio file not found: '{audio}'. "
-                    f"Make sure the file exists in the ComfyUI input directory."
-                )
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
         waveform, sample_rate = self._load_waveform(audio_path)
 
         if normalize:
-            max_val = waveform.abs().max()
-            if max_val > 0:
-                waveform = waveform / max_val
+            mx = waveform.abs().max()
+            if mx > 0:
+                waveform = waveform / mx
 
-        duration_seconds = waveform.shape[-1] / sample_rate
-        num_channels = waveform.shape[0]
-        num_samples = waveform.shape[-1]
+        total_dur = waveform.shape[-1] / sample_rate
 
+        try:
+            trim    = json.loads(trim_json) if trim_json else {}
+            t_start = float(trim.get("s", 0.0))
+            t_end   = float(trim.get("e", 0.0))
+        except Exception:
+            t_start, t_end = 0.0, 0.0
+
+        do_trim = not (t_start == 0.0 and t_end == 0.0)
+        if do_trim:
+            t_start = max(0.0, t_start)
+            t_end   = min(total_dur, t_end) if t_end > 0 else total_dur
+            if t_start >= t_end:
+                t_start, t_end, do_trim = 0.0, total_dur, False
+
+        if do_trim:
+            waveform = waveform[:, int(t_start * sample_rate):int(t_end * sample_rate)]
+
+        dur      = waveform.shape[-1] / sample_rate
         filename = os.path.basename(audio_path)
-        file_size = os.path.getsize(audio_path)
-        metadata = (
-            f"File: {filename} | "
-            f"Sample Rate: {sample_rate}Hz | "
-            f"Channels: {num_channels} | "
-            f"Samples: {num_samples} | "
-            f"Duration: {duration_seconds:.3f}s | "
-            f"Size: {file_size / 1024:.1f}KB"
+        trim_info = f" | Trim: {t_start:.3f}s – {t_end:.3f}s" if do_trim else ""
+        metadata  = (
+            f"File: {filename} | Sample Rate: {sample_rate}Hz | "
+            f"Channels: {waveform.shape[0]} | Samples: {waveform.shape[-1]} | "
+            f"Duration: {dur:.3f}s | Size: {os.path.getsize(audio_path)/1024:.1f}KB"
+            f"{trim_info}"
         )
 
-        audio_data = {
-            "waveform": waveform.unsqueeze(0),  # Add batch dim: [B, C, T]
-            "sample_rate": sample_rate,
-        }
-
-        return (audio_data, sample_rate, duration_seconds, metadata)
+        return (
+            {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},
+            sample_rate,
+            dur,
+            metadata,
+        )
 
     @classmethod
-    def IS_CHANGED(cls, audio, normalize=False):
-        # Return mtime so ComfyUI re-executes if the file changes on disk.
-        # Fall back to the audio string so it still re-executes on name change.
+    def IS_CHANGED(cls, audio, normalize=False,
+                   trim_json='{"s":0,"e":0}', unique_id="0"):
         try:
-            audio_path = folder_paths.get_annotated_filepath(audio)
-            if os.path.exists(audio_path):
-                return os.path.getmtime(audio_path)
+            p = folder_paths.get_annotated_filepath(audio)
+            if os.path.exists(p):
+                return f"{os.path.getmtime(p)}|{normalize}|{trim_json}"
         except Exception:
             pass
-        return audio
+        return f"{audio}|{normalize}|{trim_json}"
 
-    # VALIDATE_INPUTS intentionally omitted.
-    # The previous implementation rejected filenames that weren't yet in the
-    # annotated filepath cache at load time, breaking workflow restore entirely.
-    # load_audio() raises clear errors itself if the file is genuinely missing.
+    @classmethod
+    def VALIDATE_INPUTS(cls, audio, normalize=False,
+                        trim_json='{"s":0,"e":0}', unique_id="0"):
+        if not folder_paths.exists_annotated_filepath(audio):
+            return f"Audio file does not exist: {audio}"
+        return True
 
 
-# Register upload endpoint for the drag-and-drop widget
 from server import PromptServer
 from aiohttp import web
+
+@PromptServer.instance.routes.post("/axces2000/audio_trim")
+async def set_audio_trim(request):
+    """JS posts trim JSON here; we echo it back so the prompt can include it."""
+    try:
+        data = await request.json()
+        return web.json_response({"ok": True, "trim_json": json.dumps({
+            "s": float(data.get("s", 0)),
+            "e": float(data.get("e", 0)),
+        })})
+    except Exception as e:
+        return web.Response(status=400, text=str(e))
 
 
 @PromptServer.instance.routes.post("/upload/audio")
 async def upload_audio(request):
-    """Handle audio file uploads from the frontend drag-and-drop widget."""
     reader = await request.multipart()
-    field = await reader.next()
-
+    field  = await reader.next()
     if not field or field.name != "image":
         return web.Response(status=400, text="No file field found")
-
-    filename = field.filename
+    filename = os.path.basename(field.filename or "")
     if not filename:
         return web.Response(status=400, text="No filename")
-
-    filename = os.path.basename(filename)
     ext = os.path.splitext(filename)[1].lower().lstrip(".")
     if ext not in audio_extensions:
-        return web.Response(status=400, text=f"Unsupported audio format: {ext}")
-
+        return web.Response(status=400, text=f"Unsupported format: {ext}")
     input_dir = folder_paths.get_input_directory()
     save_path = os.path.join(input_dir, filename)
-
     base, extension = os.path.splitext(filename)
     counter = 1
     while os.path.exists(save_path):
-        new_filename = f"{base}_{counter}{extension}"
-        save_path = os.path.join(input_dir, new_filename)
-        filename = new_filename
-        counter += 1
-
+        filename  = f"{base}_{counter}{extension}"
+        save_path = os.path.join(input_dir, filename)
+        counter  += 1
     with open(save_path, "wb") as f:
         while chunk := await field.read_chunk(8192):
             f.write(chunk)
-
-    return web.json_response({
-        "name": filename,
-        "subfolder": "",
-        "type": "input"
-    })
+    return web.json_response({"name": filename, "subfolder": "", "type": "input"})
 
 
-NODE_CLASS_MAPPINGS = {
-    "AudioLoader": AudioLoaderNode,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "AudioLoader": "🎵 Audio Loader",
-}
+NODE_CLASS_MAPPINGS        = {"AudioLoader": AudioLoaderNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"AudioLoader": "🎵 Audio Loader"}
