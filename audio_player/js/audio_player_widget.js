@@ -33,7 +33,8 @@ const C = {
 };
 
 const PEAK_HOLD_MS = 300;
-const VIEW_MODES = ["waveform", "eq", "analyzer", "spectrogram"]; // button cycles through these
+const CLIP_THRESHOLD = 0.999969482421875; // 32767/32768 — true 16-bit ceiling
+const VIEW_MODES = ["waveform", "eq", "analyzer", "spectrogram", "combined"]; // button cycles through these
 
 // ── Spectrogram: psychoacoustic heatmap color LUT (black→purple→red→orange→yellow→white) ──
 // Precomputed once at module load — 256 entries as [r,g,b] triples.
@@ -179,7 +180,7 @@ function audioUrl(filename) {
     return `/view?filename=${encodeURIComponent(filename)}&type=temp`;
 }
 
-async function fetchWavBuffer(filename) {
+async function fetchAudioBuffer(filename) {
     const resp = await fetch(audioUrl(filename));
     if (!resp.ok)
         throw new Error("Audio not found — re-run the node");
@@ -187,112 +188,49 @@ async function fetchWavBuffer(filename) {
 }
 
 async function downloadWav(filename) {
-    const buf = await fetchWavBuffer(filename);
-    triggerDownload(new Blob([buf], {
-            type: "audio/wav"
-        }), "audio_output.wav");
+    const buf = await fetchAudioBuffer(filename);
+    triggerDownload(new Blob([buf], { type: "audio/wav" }), "audio_output.wav");
 }
 
-async function downloadMp3(filename, stereo, bitrate, onStatus) {
-    onStatus("Fetching full quality audio…");
-    const wavBuf = await fetchWavBuffer(filename);
-    onStatus("Encoding MP3…");
-
-    const audioCtx = new(window.AudioContext || window.webkitAudioContext)();
-    const buf = await audioCtx.decodeAudioData(wavBuf);
-    const nCh = (stereo && buf.numberOfChannels >= 2) ? 2 : 1;
-
-    function toPcm(ch) {
-        const f = buf.getChannelData(ch);
-        const p = new Int16Array(f.length);
-        for (let i = 0; i < f.length; i++)
-            p[i] = Math.max(-32768, Math.min(32767, f[i] * 32767));
-        return p;
-    }
-
-    const pcmL = toPcm(0);
-    const pcmR = nCh === 2 ? toPcm(1) : null;
-
-    // ── Web Worker encoding ──
-    // The lamejs encoding loop can block the main thread for many seconds on
-    // long files. We spin up an inline Worker (no extra file needed) that runs
-    // the encode loop off-thread, keeping ComfyUI fully responsive.
-    const workerSrc = `
-        self.onmessage = async function(e) {
-            const { lameUrl, nCh, sampleRate, bitrate, pcmL, pcmR } = e.data;
-
-            // Load lamejs inside the worker
-            importScripts(lameUrl);
-
-            const enc   = new lamejs.Mp3Encoder(nCh, sampleRate, bitrate);
-            const data  = [];
-            const block = 1152;
-
-            for (let i = 0; i < pcmL.length; i += block) {
-                const l   = pcmL.subarray(i, i + block);
-                const out = nCh === 2
-                    ? enc.encodeBuffer(l, pcmR.subarray(i, i + block))
-                    : enc.encodeBuffer(l);
-                if (out.length) data.push(new Uint8Array(out));
-                // Report progress every ~100 chunks
-                if (i % (block * 100) === 0)
-                    self.postMessage({ type: 'progress', pct: Math.round(i / pcmL.length * 100) });
-            }
-            const tail = enc.flush();
-            if (tail.length) data.push(new Uint8Array(tail));
-            self.postMessage({ type: 'done', data }, data.map(d => d.buffer));
-        };
-    `;
-
-    const blob = new Blob([workerSrc], {
-        type: "text/javascript"
-    });
-    const wUrl = URL.createObjectURL(blob);
-    const worker = new Worker(wUrl);
-
-    await new Promise((resolve, reject) => {
-        worker.onmessage = (e) => {
-            if (e.data.type === "progress") {
-                onStatus(`Encoding MP3… ${e.data.pct}%`);
-            } else if (e.data.type === "done") {
-                triggerDownload(new Blob(e.data.data, {
-                        type: "audio/mp3"
-                    }), "audio_output.mp3");
-                worker.terminate();
-                URL.revokeObjectURL(wUrl);
-                resolve();
-            }
-        };
-        worker.onerror = (err) => {
-            worker.terminate();
-            URL.revokeObjectURL(wUrl);
-            reject(new Error("MP3 worker error: " + err.message));
-        };
-        worker.postMessage({
-            lameUrl: location.origin + "/extensions/comfyui-axces2000/lib/lame.min.js",
-            nCh,
-            sampleRate: buf.sampleRate,
-            bitrate,
-            pcmL,
-            pcmR
-        },
-            pcmR ? [pcmL.buffer, pcmR.buffer] : [pcmL.buffer]);
-    });
-
-    onStatus(null);
-}
-
-async function downloadFlac(filename, stereo, onStatus) {
-    // Server-side encoding — Python uses soundfile/scipy for proper compressed FLAC
-    onStatus("Encoding FLAC…");
-    const resp = await fetch(`/audio_player/flac/${filename}`);
+// Server-side generic format download — all formats go through ffmpeg on the server
+async function downloadServerFormat(filename, fmt, mimeType, onStatus) {
+    onStatus(`Encoding ${fmt.toUpperCase()}…`);
+    const resp = await fetch(`/audio_player/audio/${encodeURIComponent(filename)}?fmt=${fmt}`);
     if (!resp.ok)
         throw new Error(await resp.text());
     const buf = await resp.arrayBuffer();
-    triggerDownload(new Blob([buf], {
-            type: "audio/flac"
-        }), "audio_output.flac");
+    triggerDownload(new Blob([buf], { type: mimeType }), `audio_output.${fmt}`);
     onStatus(null);
+}
+
+async function downloadMp3(filename, bitrate, onStatus) {
+    onStatus(`Encoding MP3 (${bitrate}kbps)…`);
+    const resp = await fetch(`/audio_player/audio/${encodeURIComponent(filename)}?fmt=mp3&bitrate=${bitrate}`);
+    if (!resp.ok)
+        throw new Error(await resp.text());
+    const buf = await resp.arrayBuffer();
+    triggerDownload(new Blob([buf], { type: "audio/mpeg" }), `audio_output_${bitrate}k.mp3`);
+    onStatus(null);
+}
+
+async function downloadFlac(filename, onStatus) {
+    return downloadServerFormat(filename, "flac", "audio/flac", onStatus);
+}
+
+async function downloadOgg(filename, onStatus) {
+    return downloadServerFormat(filename, "ogg", "audio/ogg", onStatus);
+}
+
+async function downloadOpus(filename, onStatus) {
+    return downloadServerFormat(filename, "opus", "audio/ogg; codecs=opus", onStatus);
+}
+
+async function downloadM4a(filename, onStatus) {
+    return downloadServerFormat(filename, "m4a", "audio/mp4", onStatus);
+}
+
+async function downloadWebm(filename, onStatus) {
+    return downloadServerFormat(filename, "webm", "audio/webm", onStatus);
 }
 
 function showDownloadMenu(filename, stereo, clientX, clientY) {
@@ -308,7 +246,7 @@ function showDownloadMenu(filename, stereo, clientX, clientY) {
         borderRadius: "8px",
         padding: "4px 0",
         zIndex: "9999",
-        minWidth: "160px",
+        minWidth: "180px",
         boxShadow: "0 4px 16px rgba(0,0,0,.5)",
         fontFamily: "sans-serif",
         fontSize: "13px",
@@ -321,6 +259,7 @@ function showDownloadMenu(filename, stereo, clientX, clientY) {
         display: "none"
     });
     menu.appendChild(statusEl);
+
     function addItem(label, cb) {
         const item = document.createElement("div");
         item.textContent = "♪  " + label;
@@ -335,37 +274,63 @@ function showDownloadMenu(filename, stereo, clientX, clientY) {
         item.onclick = cb;
         menu.appendChild(item);
     }
-    addItem("Download WAV", () => {
-        downloadWav(filename).catch(e => alert(e.message));
-        menu.remove();
-    });
-    for (const kbps of[128, 192, 320]) {
-        addItem(`Download MP3 (${kbps}kbps)`, () => {
+
+    function addSeparator(label) {
+        const sep = document.createElement("div");
+        sep.textContent = label;
+        Object.assign(sep.style, {
+            padding: "4px 14px 2px",
+            color: "#4a4880",
+            fontSize: "10px",
+            textTransform: "uppercase",
+            letterSpacing: "0.08em",
+            borderTop: "1px solid #2d2b55",
+            marginTop: "2px",
+        });
+        menu.appendChild(sep);
+    }
+
+    // Helper: async download with status + auto-close
+    function asyncItem(label, fn) {
+        addItem(label, () => {
             statusEl.style.display = "block";
-            downloadMp3(filename, stereo, kbps, msg => {
-                if (msg)
-                    statusEl.textContent = msg;
-                else
-                    menu.remove();
+            fn(msg => {
+                if (msg) statusEl.textContent = msg;
+                else menu.remove();
             }).catch(e => {
                 statusEl.textContent = "Error: " + e.message;
                 setTimeout(() => menu.remove(), 3000);
             });
         });
     }
-    addItem("Download FLAC", () => {
-        statusEl.style.display = "block";
-        downloadFlac(filename, stereo, msg => {
-            if (msg)
-                statusEl.textContent = msg;
-            else
-                menu.remove();
-        })
-        .catch(e => {
-            statusEl.textContent = "Error: " + e.message;
-            setTimeout(() => menu.remove(), 3000);
-        });
+
+    // ── Lossless ──────────────────────────────────────────────────────────────
+    addSeparator("Lossless");
+    addItem("Download WAV", () => {
+        downloadWav(filename).catch(e => alert(e.message));
+        menu.remove();
     });
+    asyncItem("Download FLAC", onStatus => downloadFlac(filename, onStatus));
+
+    // ── Lossy — server-side (all formats) ────────────────────────────────────
+    addSeparator("Lossy");
+    for (const kbps of [128, 192, 320]) {
+        addItem(`Download MP3 (${kbps}kbps)`, () => {
+            statusEl.style.display = "block";
+            downloadMp3(filename, kbps, msg => {
+                if (msg) statusEl.textContent = msg;
+                else menu.remove();
+            }).catch(e => {
+                statusEl.textContent = "Error: " + e.message;
+                setTimeout(() => menu.remove(), 3000);
+            });
+        });
+    }
+    asyncItem("Download OGG (Vorbis)", onStatus => downloadOgg(filename, onStatus));
+    asyncItem("Download Opus", onStatus => downloadOpus(filename, onStatus));
+    asyncItem("Download M4A (AAC)", onStatus => downloadM4a(filename, onStatus));
+    asyncItem("Download WebM (Opus)", onStatus => downloadWebm(filename, onStatus));
+
     document.body.appendChild(menu);
     requestAnimationFrame(() => {
         const mw = menu.offsetWidth,
@@ -380,21 +345,21 @@ function showDownloadMenu(filename, stereo, clientX, clientY) {
         menu.style.top = top + "px";
     });
     const close = (e) => {
-        // Ignore clicks inside the menu
         if (menu.contains(e.target))
             return;
-
-        // Remove menu
         menu.remove();
-
-        // Cleanup listener
         document.removeEventListener("pointerdown", close, true);
     };
-
-    // Use capture phase so it fires BEFORE other handlers
     document.addEventListener("pointerdown", close, true);
-
 }
+
+
+// ── Module-level audio element registry ──────────────────────────────────────
+// Maps filename → HTMLAudioElement.  Survives tab switches because the module
+// is never unloaded — only the widget instances come and go.  When onConfigure
+// recreates a widget for a file that is already playing, it adopts the existing
+// element instead of spawning a second one (which would cause a duplicate voice).
+const _audioRegistry = new Map();
 
 // ── Widget factory ────────────────────────────────────────────────────────────
 
@@ -409,9 +374,18 @@ function makeAudioPlayerWidget(node, data) {
     const { filename, peaks, duration, sample_rate, lufs } = data;
 
     console.log("[AudioPlayer] creating widget, filename=", data.filename, "url=", audioUrl(data.filename));
-    const audioEl = new Audio(audioUrl(data.filename));
-    audioEl.preload = "auto";
-    audioEl.addEventListener("error", e => console.error("[AudioPlayer] audio error:", e, audioEl.error));
+
+    // Adopt an existing audio element if one is already registered for this
+    // filename (happens on tab-switch restore via onConfigure).  This prevents
+    // a second audio element being created for the same file while the first
+    // one is still playing, which would produce a duplicate voice.
+    const _existingAudioEl = _audioRegistry.get(data.filename);
+    const audioEl = _existingAudioEl ?? new Audio(audioUrl(data.filename));
+    if (!_existingAudioEl) {
+        audioEl.preload = "auto";
+        audioEl.addEventListener("error", e => console.error("[AudioPlayer] audio error:", e, audioEl.error));
+    }
+    _audioRegistry.set(data.filename, audioEl);
 
     // Web Audio analyser for realtime meter — created lazily on first play
     let audioCtx = null,
@@ -439,11 +413,11 @@ function makeAudioPlayerWidget(node, data) {
 
             analyserL = audioCtx.createAnalyser();
             analyserL.fftSize = 4096;
-            analyserL.smoothingTimeConstant = 0.88;
+            analyserL.smoothingTimeConstant = 0.6;
 
             analyserR = audioCtx.createAnalyser();
             analyserR.fftSize = 4096;
-            analyserR.smoothingTimeConstant = 0.88;
+            analyserR.smoothingTimeConstant = 0.6;
 
             analyserNode = {
                 left: analyserL,
@@ -488,9 +462,11 @@ function makeAudioPlayerWidget(node, data) {
     function disconnectAnalyser() { /* no-op — single graph, no mode switching */
     }
 
-    let playing = false,
-    currentTime = 0,
-    volume = 1,
+    // If we adopted a live audio element, seed closure state from its actual
+    // runtime values so the UI is immediately consistent on restore.
+    let playing = !audioEl.paused && !audioEl.ended;
+    let currentTime = audioEl.currentTime;
+    let volume = 1,
     muted = false;
     let lastAnalyserUpdate = 0;
     const ANALYSER_INTERVAL = 1000 / 30;
@@ -507,7 +483,9 @@ function makeAudioPlayerWidget(node, data) {
     // Phase correlation meter — smoothed value, range [-1, +1]
     let _phaseCorrSmoothed = 0;
 
-    // Per-instance reusable time-domain buffers — avoids a new Uint8Array every 30 ms
+    // Per-instance reusable time-domain buffers — avoids a new Float32Array every 30 ms
+    // Float32 gives exact [-1, 1] samples; Uint8 has quantisation error that causes
+    // false clip detection (~0.4% of full scale triggers 255 prematurely).
     let _timeDomainL = null;
     let _timeDomainR = null;
 
@@ -561,6 +539,13 @@ function makeAudioPlayerWidget(node, data) {
         ensureAnalyser();
         startRAF();
     });
+
+    // If we adopted an already-playing element, resume the RAF loop now
+    // (the "play" event won't fire again for an element that's mid-playback).
+    if (playing) {
+        ensureAnalyser();
+        startRAF();
+    }
 
     audioEl.addEventListener("pause", () => {
         playing = false;
@@ -688,15 +673,43 @@ function makeAudioPlayerWidget(node, data) {
         if (sgW < 4 || sgH < 4)
             return;
 
-        // ── Fallback: not playing or analyser unavailable ──
-        if (!analyserNode?.left || !playing) {
-            ctx.save();
-            ctx.fillStyle = C.textDim;
-            ctx.font = "italic 10px sans-serif";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            ctx.fillText("SPECTROGRAM ACTIVE DURING PLAYBACK", sgX + sgW / 2, sgY + sgH / 2);
-            ctx.restore();
+        // ── Fallback: analyser never initialised (before first play) ──
+        if (!analyserNode?.left) {
+            if (!_specCanvas) {
+                // Nothing ever rendered — show hint
+                ctx.save();
+                ctx.fillStyle = C.textDim;
+                ctx.font = "italic 10px sans-serif";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.beginPath();
+                ctx.rect(sgX, sgY, sgW, sgH);
+                ctx.clip();
+                const _sgMsg = sgW < 180 ? "PLAY TO ACTIVATE" : "SPECTROGRAM ACTIVE DURING PLAYBACK";
+                ctx.fillText(_sgMsg, sgX + sgW / 2, sgY + sgH / 2);
+                ctx.restore();
+            } else {
+                // Paused with existing buffer — freeze it
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(sgX, sgY, sgW, sgH);
+                ctx.clip();
+                ctx.drawImage(_specCanvas, sgX, sgY);
+                ctx.restore();
+            }
+            return;
+        }
+
+        // ── Paused but analyser ready — blit frozen frame ──
+        if (!playing) {
+            if (_specCanvas) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(sgX, sgY, sgW, sgH);
+                ctx.clip();
+                ctx.drawImage(_specCanvas, sgX, sgY);
+                ctx.restore();
+            }
             return;
         }
 
@@ -980,6 +993,205 @@ function makeAudioPlayerWidget(node, data) {
                      : [])
             ];
 
+            // ── Shared EQ/Spectrum draw helper ───────────────────────────────────
+            // Hoisted above the view dispatch so it is available to both
+            // the eq/analyzer views and the combined view.
+            // ── Shared helper: draws a Mel-scale spectrum fill ────────────
+            const drawEQ = (eqX, eqW, eqTop, eqBottom, eqH, showLabels) => {
+                ctx.save(); // ← isolate ALL state changes inside drawEQ
+
+                // Guard: analyser not yet initialised (before first play) — show hint.
+                // When paused after playing, fall through using frozen frequency data.
+                if (!analyserNode?.left) {
+                    if (!this._freqDataFrozen) {
+                        ctx.font = "italic 10px sans-serif";
+                        ctx.textAlign = "center";
+                        ctx.fillStyle = C.textDim;
+                        ctx.beginPath();
+                        ctx.rect(eqX, eqTop, eqW, eqBottom - eqTop);
+                        ctx.clip();
+                        const _msgs = [
+                            "SPECTRUM ACTIVE DURING PLAYBACK",
+                            "ACTIVE DURING PLAYBACK",
+                            "PLAY TO ACTIVATE",
+                            "PLAY ▶",
+                        ];
+                        let _eqMsg = _msgs[_msgs.length - 1];
+                        for (const m of _msgs) {
+                            if (ctx.measureText(m).width <= eqW - 8) { _eqMsg = m; break; }
+                        }
+                        ctx.fillText(_eqMsg, eqX + eqW / 2, (eqTop + eqBottom) / 2);
+                        ctx.restore();
+                        return;
+                    }
+                    // Analyser was connected but node is paused — use frozen snapshot
+                }
+
+                // Allocate (or reuse) the frequency data buffer.
+                if (!this._freqData || this._freqData.length !== analyserL?.frequencyBinCount)
+                    this._freqData = new Uint8Array(analyserL?.frequencyBinCount ?? 1024);
+                if (playing) {
+                    analyserL.getByteFrequencyData(this._freqData);
+                    // Keep a frozen copy for when playback stops
+                    if (!this._freqDataFrozen || this._freqDataFrozen.length !== this._freqData.length)
+                        this._freqDataFrozen = new Uint8Array(this._freqData.length);
+                    this._freqDataFrozen.set(this._freqData);
+                } else if (this._freqDataFrozen) {
+                    this._freqData.set(this._freqDataFrozen);
+                }
+                const freqData = this._freqData;
+
+                // ── Mel-scale frequency mapping ───────────────────────────
+                // We cap usable bins at 75% of the FFT output to discard
+                // ultrasonic noise above ~16 kHz.  The remaining bins are
+                // mapped onto the canvas width using the Mel scale, which
+                // perceptually spaces low frequencies (where human hearing
+                // has the most resolution) more widely than high frequencies.
+                const binCount = Math.floor(analyserL.frequencyBinCount * 0.75);
+                const nyquist = (analyserL.context?.sampleRate ?? 44100) / 2;
+                const hzPerBin = nyquist / analyserL.frequencyBinCount;
+                const melOf = (hz) => 2595 * Math.log10(1 + hz / 700);
+                const melMin = melOf(20);       // ~20 Hz floor
+                const melMax = melOf(binCount * hzPerBin);
+                const melRange = melMax - melMin;
+
+                // Convert a horizontal fraction (0–1) to a fractional FFT bin
+                // index using the inverse Mel formula.
+                const fracToBinFloat = (frac) => {
+                    const hz = 700 * (Math.pow(10, (melMin + frac * melRange) / 2595) - 1);
+                    return hz / hzPerBin;
+                };
+
+                // ── Build the spectrum path ───────────────────────────────
+                // One plotPoint per canvas pixel wide. For low-frequency
+                // bins that map to many pixels (widthInBins ≤ 1.2) we
+                // interpolate between adjacent bins. For high-frequency
+                // regions where multiple bins map to one pixel we average
+                // them to avoid aliasing.
+                const plotPoints = Math.ceil(eqW);
+                ctx.beginPath();
+                ctx.moveTo(eqX, eqBottom); // start at bottom-left so the path closes correctly
+
+                for (let p = 0; p < plotPoints; p++) {
+                    const binStart = fracToBinFloat(p / plotPoints);
+                    const binEnd = fracToBinFloat((p + 1) / plotPoints);
+                    const widthInBins = binEnd - binStart;
+                    let val = 0;
+
+                    if (widthInBins <= 1.2) {
+                        // Narrow region: linearly interpolate between the two
+                        // flanking bins for a smooth sub-bin curve.
+                        const index = Math.floor(binStart);
+                        const weight = binStart - index;
+                        val = index >= binCount - 1
+                             ? freqData[binCount - 1]
+                             : freqData[index] * (1 - weight) + freqData[index + 1] * weight;
+                    } else {
+                        // Wide region (low-frequency area where many bins
+                        // compress into one pixel): average all covered bins
+                        // to represent the band energy honestly.
+                        let sum = 0,
+                        count = 0;
+                        for (let b = Math.floor(binStart); b <= Math.ceil(binEnd); b++) {
+                            if (b < binCount) {
+                                sum += freqData[b];
+                                count++;
+                            }
+                        }
+                        val = count > 0 ? sum / count : 0;
+                    }
+
+                    // Subtract a small noise floor (2/255) to suppress
+                    // the faint DC hum that appears even in silence.
+                    val = Math.max(0, val - 2);
+                    const px = eqX + (p / Math.max(1, plotPoints - 1)) * eqW;
+                    // Map 0–255 FFT magnitude to the available vertical height
+                    const py = eqBottom - (val / 255) * eqH;
+                    ctx.lineTo(px, py);
+                }
+
+                // Close the path back along the bottom edge to form a filled shape.
+                ctx.lineTo(eqX + eqW, eqBottom);
+                ctx.closePath();
+
+                // ── Gradient fill ─────────────────────────────────────────
+                // Purple at the bottom → orange at the top. Cached by the
+                // eqBottom/eqTop coordinates; invalidated whenever the
+                // visualisation area is resized.
+                if (!_eqGradCache ||
+                    _eqGradCache.eqBottom !== eqBottom ||
+                    _eqGradCache.eqTop !== eqTop) {
+                    const g = ctx.createLinearGradient(0, eqBottom, 0, eqTop);
+                    g.addColorStop(0, C.barPlayedLeft + "aa");
+                    g.addColorStop(1, C.barPlayedRight);
+                    _eqGradCache = {
+                        grad: g,
+                        eqBottom,
+                        eqTop
+                    };
+                }
+                ctx.fillStyle = _eqGradCache.grad;
+                ctx.globalAlpha = 1.0;
+                ctx.fill();
+
+                // ── Glowing white rim stroke ──────────────────────────────
+                // A thin white line drawn on top of the fill with a soft
+                // shadow gives the curve a neon phosphor look.
+                ctx.lineJoin = "round";
+                ctx.lineCap = "round";
+                ctx.shadowBlur = 4;
+                ctx.shadowColor = "rgba(255,255,255,0.4)";
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+
+                // ── Frequency labels (eq mode only) ──────────────────────
+                // A semi-transparent dark bar at the bottom of the spectrum
+                // carrying four reference frequency markers. Hidden in
+                // analyzer mode where space is tight.
+                if (showLabels) {
+                    ctx.save();
+                    ctx.globalAlpha = 1.0;
+                    // Dark background strip behind the labels
+                    ctx.fillStyle = "rgba(0,0,0,0.5)";
+                    ctx.fillRect(eqX, eqBottom - 18, eqW, 18);
+                    // Thin separator line above the strip
+                    ctx.strokeStyle = "rgba(255,255,255,0.1)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(eqX, eqBottom - 18);
+                    ctx.lineTo(eqX + eqW, eqBottom - 18);
+                    ctx.stroke();
+                    // Label positions are expressed as fractions of eqW,
+                    // manually tuned to land near the corresponding Mel-scale
+                    // positions for each frequency.
+                    const labels = [{
+                            text: "60Hz",
+                            pos: 0.04
+                        }, {
+                            text: "1kHz",
+                            pos: 0.33
+                        }, {
+                            text: "5kHz",
+                            pos: 0.65
+                        }, {
+                            text: "15kHz",
+                            pos: 0.92
+                        },
+                    ];
+                    ctx.font = "bold 10px sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    labels.forEach(lbl => {
+                        ctx.fillStyle = "#fff";
+                        ctx.fillText(lbl.text, eqX + lbl.pos * eqW, eqBottom - 9);
+                    });
+                    ctx.restore(); // inner labels save
+                }
+                ctx.restore(); // outer drawEQ save — restores shadow, lineJoin, etc.
+            };
+
             // ── Main visualisation area ───────────────────────────────────────
             // Dispatches to one of four renderers based on the current viewMode.
             // All renderers paint into the rect defined by L.wfTop/wfBottom/wfX/totalW.
@@ -1094,179 +1306,6 @@ function makeAudioPlayerWidget(node, data) {
                 //   eqH          – height shorthand (eqBottom - eqTop)
                 //   showLabels   – whether to overlay the frequency tick labels
 
-                // ── Shared helper: draws a Mel-scale spectrum fill ────────────
-                const drawEQ = (eqX, eqW, eqTop, eqBottom, eqH, showLabels) => {
-                    ctx.save(); // ← isolate ALL state changes inside drawEQ
-
-                    // Guard: analyser is created lazily on first play. Show a
-                    // placeholder message when the graph isn't live yet.
-                    if (!analyserNode?.left || !playing) {
-                        ctx.fillStyle = C.textDim;
-                        ctx.font = "italic 10px sans-serif";
-                        ctx.textAlign = "center";
-                        ctx.fillText("SPECTRUM ACTIVE DURING PLAYBACK",
-                            eqX + eqW / 2, (eqTop + eqBottom) / 2);
-                        ctx.restore();
-                        return;
-                    }
-
-                    // Allocate (or reuse) the frequency data buffer.
-                    if (!this._freqData || this._freqData.length !== analyserL.frequencyBinCount)
-                        this._freqData = new Uint8Array(analyserL.frequencyBinCount);
-                    analyserL.getByteFrequencyData(this._freqData);
-                    const freqData = this._freqData;
-
-                    // ── Mel-scale frequency mapping ───────────────────────────
-                    // We cap usable bins at 75% of the FFT output to discard
-                    // ultrasonic noise above ~16 kHz.  The remaining bins are
-                    // mapped onto the canvas width using the Mel scale, which
-                    // perceptually spaces low frequencies (where human hearing
-                    // has the most resolution) more widely than high frequencies.
-                    const binCount = Math.floor(analyserL.frequencyBinCount * 0.75);
-                    const nyquist = (analyserL.context?.sampleRate ?? 44100) / 2;
-                    const hzPerBin = nyquist / analyserL.frequencyBinCount;
-                    const melOf = (hz) => 2595 * Math.log10(1 + hz / 700);
-                    const melMin = melOf(20);       // ~20 Hz floor
-                    const melMax = melOf(binCount * hzPerBin);
-                    const melRange = melMax - melMin;
-
-                    // Convert a horizontal fraction (0–1) to a fractional FFT bin
-                    // index using the inverse Mel formula.
-                    const fracToBinFloat = (frac) => {
-                        const hz = 700 * (Math.pow(10, (melMin + frac * melRange) / 2595) - 1);
-                        return hz / hzPerBin;
-                    };
-
-                    // ── Build the spectrum path ───────────────────────────────
-                    // One plotPoint per canvas pixel wide. For low-frequency
-                    // bins that map to many pixels (widthInBins ≤ 1.2) we
-                    // interpolate between adjacent bins. For high-frequency
-                    // regions where multiple bins map to one pixel we average
-                    // them to avoid aliasing.
-                    const plotPoints = Math.ceil(eqW);
-                    ctx.beginPath();
-                    ctx.moveTo(eqX, eqBottom); // start at bottom-left so the path closes correctly
-
-                    for (let p = 0; p < plotPoints; p++) {
-                        const binStart = fracToBinFloat(p / plotPoints);
-                        const binEnd = fracToBinFloat((p + 1) / plotPoints);
-                        const widthInBins = binEnd - binStart;
-                        let val = 0;
-
-                        if (widthInBins <= 1.2) {
-                            // Narrow region: linearly interpolate between the two
-                            // flanking bins for a smooth sub-bin curve.
-                            const index = Math.floor(binStart);
-                            const weight = binStart - index;
-                            val = index >= binCount - 1
-                                 ? freqData[binCount - 1]
-                                 : freqData[index] * (1 - weight) + freqData[index + 1] * weight;
-                        } else {
-                            // Wide region (low-frequency area where many bins
-                            // compress into one pixel): average all covered bins
-                            // to represent the band energy honestly.
-                            let sum = 0,
-                            count = 0;
-                            for (let b = Math.floor(binStart); b <= Math.ceil(binEnd); b++) {
-                                if (b < binCount) {
-                                    sum += freqData[b];
-                                    count++;
-                                }
-                            }
-                            val = count > 0 ? sum / count : 0;
-                        }
-
-                        // Subtract a small noise floor (2/255) to suppress
-                        // the faint DC hum that appears even in silence.
-                        val = Math.max(0, val - 2);
-                        const px = eqX + (p / Math.max(1, plotPoints - 1)) * eqW;
-                        // Map 0–255 FFT magnitude to the available vertical height
-                        const py = eqBottom - (val / 255) * eqH;
-                        ctx.lineTo(px, py);
-                    }
-
-                    // Close the path back along the bottom edge to form a filled shape.
-                    ctx.lineTo(eqX + eqW, eqBottom);
-                    ctx.closePath();
-
-                    // ── Gradient fill ─────────────────────────────────────────
-                    // Purple at the bottom → orange at the top. Cached by the
-                    // eqBottom/eqTop coordinates; invalidated whenever the
-                    // visualisation area is resized.
-                    if (!_eqGradCache ||
-                        _eqGradCache.eqBottom !== eqBottom ||
-                        _eqGradCache.eqTop !== eqTop) {
-                        const g = ctx.createLinearGradient(0, eqBottom, 0, eqTop);
-                        g.addColorStop(0, C.barPlayedLeft + "aa");
-                        g.addColorStop(1, C.barPlayedRight);
-                        _eqGradCache = {
-                            grad: g,
-                            eqBottom,
-                            eqTop
-                        };
-                    }
-                    ctx.fillStyle = _eqGradCache.grad;
-                    ctx.globalAlpha = 1.0;
-                    ctx.fill();
-
-                    // ── Glowing white rim stroke ──────────────────────────────
-                    // A thin white line drawn on top of the fill with a soft
-                    // shadow gives the curve a neon phosphor look.
-                    ctx.lineJoin = "round";
-                    ctx.lineCap = "round";
-                    ctx.shadowBlur = 4;
-                    ctx.shadowColor = "rgba(255,255,255,0.4)";
-                    ctx.strokeStyle = "#fff";
-                    ctx.lineWidth = 2;
-                    ctx.stroke();
-                    ctx.shadowBlur = 0;
-
-                    // ── Frequency labels (eq mode only) ──────────────────────
-                    // A semi-transparent dark bar at the bottom of the spectrum
-                    // carrying four reference frequency markers. Hidden in
-                    // analyzer mode where space is tight.
-                    if (showLabels) {
-                        ctx.save();
-                        ctx.globalAlpha = 1.0;
-                        // Dark background strip behind the labels
-                        ctx.fillStyle = "rgba(0,0,0,0.5)";
-                        ctx.fillRect(eqX, eqBottom - 18, eqW, 18);
-                        // Thin separator line above the strip
-                        ctx.strokeStyle = "rgba(255,255,255,0.1)";
-                        ctx.lineWidth = 1;
-                        ctx.beginPath();
-                        ctx.moveTo(eqX, eqBottom - 18);
-                        ctx.lineTo(eqX + eqW, eqBottom - 18);
-                        ctx.stroke();
-                        // Label positions are expressed as fractions of eqW,
-                        // manually tuned to land near the corresponding Mel-scale
-                        // positions for each frequency.
-                        const labels = [{
-                                text: "60Hz",
-                                pos: 0.04
-                            }, {
-                                text: "1kHz",
-                                pos: 0.33
-                            }, {
-                                text: "5kHz",
-                                pos: 0.65
-                            }, {
-                                text: "15kHz",
-                                pos: 0.92
-                            },
-                        ];
-                        ctx.font = "bold 10px sans-serif";
-                        ctx.textAlign = "center";
-                        ctx.textBaseline = "middle";
-                        labels.forEach(lbl => {
-                            ctx.fillStyle = "#fff";
-                            ctx.fillText(lbl.text, eqX + lbl.pos * eqW, eqBottom - 9);
-                        });
-                        ctx.restore(); // inner labels save
-                    }
-                    ctx.restore(); // outer drawEQ save — restores shadow, lineJoin, etc.
-                };
-
                 if (viewMode === "eq") {
                     // ── Full-width spectrum (eq mode) ─────────────────────────
                     // Spectrum fills the entire visualisation rect with labels.
@@ -1376,11 +1415,18 @@ function makeAudioPlayerWidget(node, data) {
                     // with a slow attack / fast release to avoid jarring jumps.
                     if (analyserNode?.left && analyserNode?.right && playing) {
                         if (!_timeDomainL || _timeDomainL.length !== analyserL.fftSize) {
-                            _timeDomainL = new Uint8Array(analyserL.fftSize);
-                            _timeDomainR = new Uint8Array(analyserR.fftSize);
+                            _timeDomainL = new Float32Array(analyserL.fftSize);
+                            _timeDomainR = new Float32Array(analyserR.fftSize);
                         }
-                        analyserL.getByteTimeDomainData(_timeDomainL);
-                        analyserR.getByteTimeDomainData(_timeDomainR);
+                        analyserL.getFloatTimeDomainData(_timeDomainL);
+                        analyserR.getFloatTimeDomainData(_timeDomainR);
+                        // Save frozen snapshot for pause display
+                        if (!this._gonFrozenL || this._gonFrozenL.length !== _timeDomainL.length) {
+                            this._gonFrozenL = new Float32Array(_timeDomainL.length);
+                            this._gonFrozenR = new Float32Array(_timeDomainR.length);
+                        }
+                        this._gonFrozenL.set(_timeDomainL);
+                        this._gonFrozenR.set(_timeDomainR);
 
                         // ── Dynamic auto-gain ─────────────────────────────────
                         // Compute peak amplitude this frame to scale the trace
@@ -1391,10 +1437,9 @@ function makeAudioPlayerWidget(node, data) {
                         // CPU cost fixed regardless of FFT size.
                         const step = Math.max(1, Math.floor(_timeDomainL.length / 512));
                         for (let i = 0; i < _timeDomainL.length; i += step) {
-                            // getByteTimeDomainData returns 0–255; 128 = silence.
-                            // Normalise to −1…+1 then take absolute value for peak.
-                            const Ls = Math.abs((_timeDomainL[i] / 128) - 1);
-                            const Rs = Math.abs((_timeDomainR[i] / 128) - 1);
+                            // getFloatTimeDomainData returns exact −1…+1 samples.
+                            const Ls = Math.abs(_timeDomainL[i]);
+                            const Rs = Math.abs(_timeDomainR[i]);
                             if (Ls > peakAmp)
                                 peakAmp = Ls;
                             if (Rs > peakAmp)
@@ -1419,8 +1464,8 @@ function makeAudioPlayerWidget(node, data) {
 
                         ctx.beginPath();
                         for (let i = 0; i < _timeDomainL.length; i += step) {
-                            const Ls = (_timeDomainL[i] / 128) - 1; // normalised L sample
-                            const Rs = (_timeDomainR[i] / 128) - 1; // normalised R sample
+                            const Ls = _timeDomainL[i]; // exact −1…+1 float sample
+                            const Rs = _timeDomainR[i];
                             // M-S projection: X = Side (L−R), Y = −Mid (L+R) flipped
                             // so that positive Mid points upward.
                             const gx = gonCX + (Ls - Rs) * scale;
@@ -1439,8 +1484,31 @@ function makeAudioPlayerWidget(node, data) {
                         ctx.shadowBlur = 0;
                         ctx.globalAlpha = 1.0;
                         ctx.restore();
+                    } else if (this._gonFrozenL) {
+                        // Paused with a frozen snapshot — redraw last frame dimmed
+                        const frozenScale = gonR * 0.88 * (this._gonGain || 1.0);
+                        const step = Math.max(1, Math.floor(this._gonFrozenL.length / 512));
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.arc(gonCX, gonCY, gonR - 1, 0, Math.PI * 2);
+                        ctx.clip();
+                        ctx.beginPath();
+                        for (let i = 0; i < this._gonFrozenL.length; i += step) {
+                            const Ls = this._gonFrozenL[i];
+                            const Rs = this._gonFrozenR[i];
+                            const gx = gonCX + (Ls - Rs) * frozenScale;
+                            const gy = gonCY - (Ls + Rs) * frozenScale;
+                            i === 0 ? ctx.moveTo(gx, gy) : ctx.lineTo(gx, gy);
+                        }
+                        ctx.strokeStyle = "rgba(0, 180, 210, 0.45)";
+                        ctx.lineWidth = 1.5;
+                        ctx.globalAlpha = 0.5;
+                        ctx.lineJoin = "round";
+                        ctx.stroke();
+                        ctx.globalAlpha = 1.0;
+                        ctx.restore();
                     } else {
-                        // Analyser not yet initialised or not playing — show hint
+                        // Never played yet — show hint
                         ctx.fillStyle = C.textDim;
                         ctx.font = "italic 9px sans-serif";
                         ctx.textAlign = "center";
@@ -1461,7 +1529,7 @@ function makeAudioPlayerWidget(node, data) {
                         // ── Compute Pearson correlation ───────────────────────
                         // Uses the same strided time-domain buffers fetched for
                         // the goniometer above. Falls back to 0 when not playing.
-                        let rawCorr = 0;
+                        let rawCorr = _phaseCorrSmoothed; // default: hold last value
                         if (analyserNode?.left && analyserNode?.right && playing &&
                             _timeDomainL && _timeDomainR) {
                             let sumLR = 0,
@@ -1469,8 +1537,8 @@ function makeAudioPlayerWidget(node, data) {
                             sumR2 = 0;
                             const step = Math.max(1, Math.floor(_timeDomainL.length / 512));
                             for (let i = 0; i < _timeDomainL.length; i += step) {
-                                const lv = (_timeDomainL[i] / 128) - 1; // −1…+1
-                                const rv = (_timeDomainR[i] / 128) - 1;
+                                const lv = _timeDomainL[i]; // exact −1…+1 float sample
+                                const rv = _timeDomainR[i];
                                 sumLR += lv * rv;   // cross product
                                 sumL2 += lv * lv;   // L energy
                                 sumR2 += rv * rv;   // R energy
@@ -1732,6 +1800,364 @@ function makeAudioPlayerWidget(node, data) {
                 // own offscreen rolling-buffer canvas (_specCanvas). See that
                 // function for full implementation details.
                 drawSpectrogram(ctx, L);
+
+            } else if (viewMode === "combined") {
+                // ── COMBINED VIEW ─────────────────────────────────────────────
+                // Divides the visualisation area into four quadrants:
+                //
+                //   ┌──────────────────────┬──────────┐
+                //   │   Waveform (top)      │ Spectro- │
+                //   │   full width          │ gram     │
+                //   ├───────────┬───────────┤ (right)  │
+                //   │ Spectrum  │ Goniometer│          │
+                //   │ (bot-left)│ (bot-right│          │
+                //   └───────────┴───────────┴──────────┘
+                //
+                // Layout constants (fractions of available area):
+                const combSplitY = L.wfTop + Math.round(L.wfH * 0.55); // waveform takes top 55%
+                const combSpecW  = Math.round(L.totalW * 0.28);          // spectrogram takes right 28%
+                const combMainW  = L.totalW - combSpecW - 6;             // remaining width (gap=6)
+                const combBotH   = L.wfBottom - combSplitY - 2;         // bottom row height
+                const combEqW    = Math.round(combMainW * 0.52);         // spectrum gets 52% of bottom-left
+                const combGonW   = combMainW - combEqW - 6;             // goniometer gets the rest
+
+                // ── Top row: waveform ─────────────────────────────────────────
+                // Uses its own bar geometry based on combMainW so bars never
+                // extend into the spectrogram column. Cached separately from
+                // the full waveform view to avoid cross-contaminating the cache.
+                {
+                    // Compute bar geometry for combMainW (not L.totalW)
+                    const combWfAvail = combMainW;
+                    const combNBars   = Math.min(peaks.ch0.length, Math.max(10, Math.floor(combWfAvail / (2 + BAR_GAP))));
+                    const combBarW    = Math.max(2, (combWfAvail - BAR_GAP * (combNBars - 1)) / combNBars);
+                    const combWfH     = combSplitY - L.wfTop;  // height of waveform row
+                    const combChH     = L.stereo ? Math.floor((combWfH - 6) / 2) : combWfH;
+
+                    const snapProgress = Math.round(progress * combNBars);
+                    // "C:" prefix keeps this cache key distinct from waveform mode
+                    const cacheKey = `C:${L._w}|${L._h}|${snapProgress}|${playing ? 1 : 0}|${phase.toFixed(1)}`;
+
+                    if (!this._combWfCache || this._combWfCache.key !== cacheKey) {
+                        const osc = this._combWfCache?.canvas || document.createElement("canvas");
+                        osc.width  = w;
+                        osc.height = node.size[1];
+                        const oc = osc.getContext("2d");
+                        oc.clearRect(0, 0, osc.width, osc.height);
+
+                        // Build per-channel geometry mirroring the main waveform layout
+                        const combChannels = [];
+                        const stereo = !!peaks.ch1;
+                        if (stereo) {
+                            const ch0MidY = L.wfTop + Math.floor(combChH / 2);
+                            const ch1MidY = L.wfTop + combChH + 6 + Math.floor(combChH / 2);
+                            combChannels.push({ p: peaks.ch0, midY: ch0MidY, chH: combChH, played: C.barPlayedLeft,  idle: C.barIdle, pulse: PULSE_L });
+                            combChannels.push({ p: peaks.ch1, midY: ch1MidY, chH: combChH, played: C.barPlayedRight, idle: C.barIdle, pulse: PULSE_R });
+                        } else {
+                            const ch0MidY = L.wfTop + Math.floor(combWfH / 2);
+                            combChannels.push({ p: peaks.ch0, midY: ch0MidY, chH: combWfH, played: C.barPlayedLeft, idle: C.barIdle, pulse: PULSE_L });
+                        }
+
+                        for (const ch of combChannels) {
+                            for (let i = 0; i < combNBars; i++) {
+                                const bx   = L.wfX + i * (combBarW + BAR_GAP);
+                                const frac = i / combNBars;
+                                const done = frac < progress;
+                                const pi   = Math.min(ch.p.length - 1, Math.floor(frac * ch.p.length));
+                                let h      = Math.max(2, ch.p[pi] * ch.chH * 0.88);
+                                const nearHead = Math.abs(frac - progress);
+                                if (playing && done && nearHead < 0.05) {
+                                    oc.globalAlpha = 1.0;
+                                    h = Math.min(h * 1.08, ch.chH * 0.95);
+                                    oc.fillStyle = ch.pulse[Math.round(Math.max(0, 100 - (nearHead / 0.05 * 100)))];
+                                } else {
+                                    oc.globalAlpha = done ? 1.0 : 0.35;
+                                    oc.fillStyle   = done ? ch.played : ch.idle;
+                                }
+                                rr(oc, bx, ch.midY - h / 2, combBarW, h, Math.min(2, combBarW / 2));
+                                oc.fill();
+                            }
+                            // Channel label
+                            oc.globalAlpha = 1.0;
+                            const label = stereo ? (ch === combChannels[0] ? "L" : "R") : "M";
+                            oc.font = "bold 9px sans-serif";
+                            const lblW = oc.measureText(label).width;
+                            oc.fillStyle = "rgba(0,0,0,0.55)";
+                            rr(oc, L.wfX, ch.midY - 7, lblW + 6, 14, 3);
+                            oc.fill();
+                            oc.fillStyle = C.btnActive;
+                            oc.textAlign = "left";
+                            oc.textBaseline = "middle";
+                            oc.fillText(label, L.wfX + 3, ch.midY);
+                        }
+                        oc.globalAlpha = 1.0;
+                        this._combWfCache = { canvas: osc, key: cacheKey };
+                    }
+
+                    // Blit — clip to waveform rect to be safe
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(L.wfX, L.wfTop, combMainW, combWfH);
+                    ctx.clip();
+                    ctx.drawImage(this._combWfCache.canvas, 0, 0);
+                    ctx.restore();
+
+                    // Expose combNBars for the playhead below
+                    this._combNBars  = combNBars;
+                    this._combBarW   = combBarW;
+                }
+
+                // ── Divider line ──────────────────────────────────────────────
+                ctx.save();
+                ctx.strokeStyle = "rgba(255,255,255,0.08)";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(L.wfX, combSplitY);
+                ctx.lineTo(L.wfX + combMainW, combSplitY);
+                ctx.stroke();
+                ctx.restore();
+
+                // ── Bottom-left: spectrum (EQ) ────────────────────────────────
+                drawEQ(L.wfX, combEqW, combSplitY + 2, L.wfBottom, combBotH - 2, false);
+
+                // Divider between spectrum and goniometer
+                ctx.save();
+                ctx.strokeStyle = "rgba(255,255,255,0.08)";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(L.wfX + combEqW + 3, combSplitY + 4);
+                ctx.lineTo(L.wfX + combEqW + 3, L.wfBottom - 4);
+                ctx.stroke();
+                ctx.restore();
+
+                // ── Bottom-right: mini goniometer ─────────────────────────────
+                {
+                    const mgX    = L.wfX + combEqW + 6;
+                    const mgSize = Math.min(combGonW, combBotH);
+                    const mgCX   = mgX + combGonW / 2;
+                    const mgCY   = combSplitY + 2 + combBotH / 2;
+                    const mgR    = mgSize / 2 - 3;
+
+                    ctx.save();
+                    // Background circle
+                    ctx.beginPath();
+                    ctx.arc(mgCX, mgCY, mgR, 0, Math.PI * 2);
+                    ctx.fillStyle = "rgba(0,18,28,0.92)";
+                    ctx.fill();
+                    // Rings
+                    for (let ri = 1; ri <= 3; ri++) {
+                        ctx.beginPath();
+                        ctx.arc(mgCX, mgCY, mgR * (ri / 3), 0, Math.PI * 2);
+                        ctx.strokeStyle = `rgba(0,200,255,${ri === 3 ? 0.25 : 0.10})`;
+                        ctx.lineWidth = ri === 3 ? 1 : 0.5;
+                        ctx.stroke();
+                    }
+                    // Border
+                    ctx.beginPath();
+                    ctx.arc(mgCX, mgCY, mgR, 0, Math.PI * 2);
+                    ctx.strokeStyle = C.barIdle;
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                    // Crosshair
+                    ctx.beginPath();
+                    ctx.arc(mgCX, mgCY, mgR - 1, 0, Math.PI * 2);
+                    ctx.clip();
+                    ctx.strokeStyle = "rgba(0,200,255,0.15)";
+                    ctx.lineWidth = 0.5;
+                    ctx.setLineDash([2, 3]);
+                    ctx.beginPath();
+                    ctx.moveTo(mgCX, mgCY - mgR); ctx.lineTo(mgCX, mgCY + mgR);
+                    ctx.moveTo(mgCX - mgR, mgCY); ctx.lineTo(mgCX + mgR, mgCY);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    // Trace
+                    if (_timeDomainL && _timeDomainR && playing) {
+                        const step = Math.max(1, Math.floor(_timeDomainL.length / 512));
+                        if (!this._gonGainC) this._gonGainC = 1.0;
+                        let peakAmp = 0;
+                        for (let i = 0; i < _timeDomainL.length; i += step) {
+                            const a = Math.abs(_timeDomainL[i]), b = Math.abs(_timeDomainR[i]);
+                            if (a > peakAmp) peakAmp = a;
+                            if (b > peakAmp) peakAmp = b;
+                        }
+                        const tgt = peakAmp > 0.001 ? Math.min(3.0, 0.7 / peakAmp) : this._gonGainC;
+                        this._gonGainC += (tgt - this._gonGainC) * (tgt < this._gonGainC ? 0.3 : 0.05);
+                        const scale = mgR * 0.88 * this._gonGainC;
+                        ctx.beginPath();
+                        for (let i = 0; i < _timeDomainL.length; i += step) {
+                            const Ls = _timeDomainL[i], Rs = _timeDomainR[i];
+                            const gx = mgCX + (Ls - Rs) * scale;
+                            const gy = mgCY - (Ls + Rs) * scale;
+                            i === 0 ? ctx.moveTo(gx, gy) : ctx.lineTo(gx, gy);
+                        }
+                        ctx.shadowColor = "rgba(0,230,255,0.7)";
+                        ctx.shadowBlur = 4;
+                        ctx.strokeStyle = "rgba(0,220,255,0.85)";
+                        ctx.lineWidth = 1;
+                        ctx.globalAlpha = 0.75;
+                        ctx.stroke();
+                        ctx.shadowBlur = 0;
+                        ctx.globalAlpha = 1.0;
+                        // Save frozen snapshot
+                        if (!this._combGonFrozenL || this._combGonFrozenL.length !== _timeDomainL.length) {
+                            this._combGonFrozenL = new Float32Array(_timeDomainL.length);
+                            this._combGonFrozenR = new Float32Array(_timeDomainR.length);
+                        }
+                        this._combGonFrozenL.set(_timeDomainL);
+                        this._combGonFrozenR.set(_timeDomainR);
+                    } else if (this._combGonFrozenL) {
+                        // Paused — redraw last frame dimmed
+                        const scale = mgR * 0.88 * (this._gonGainC || 1.0);
+                        const step = Math.max(1, Math.floor(this._combGonFrozenL.length / 512));
+                        ctx.beginPath();
+                        for (let i = 0; i < this._combGonFrozenL.length; i += step) {
+                            const Ls = this._combGonFrozenL[i], Rs = this._combGonFrozenR[i];
+                            const gx = mgCX + (Ls - Rs) * scale;
+                            const gy = mgCY - (Ls + Rs) * scale;
+                            i === 0 ? ctx.moveTo(gx, gy) : ctx.lineTo(gx, gy);
+                        }
+                        ctx.strokeStyle = "rgba(0,180,210,0.45)";
+                        ctx.lineWidth = 1;
+                        ctx.globalAlpha = 0.5;
+                        ctx.stroke();
+                        ctx.globalAlpha = 1.0;
+                    } else {
+                        ctx.fillStyle = C.textDim;
+                        ctx.font = "italic 7px sans-serif";
+                        ctx.textAlign = "center";
+                        ctx.textBaseline = "middle";
+                        ctx.fillText("PLAY", mgCX, mgCY);
+                    }
+                    ctx.restore();
+                }
+
+                // ── Right column: spectrogram strip ───────────────────────────
+                // Drawn inline without touching the module-level _spec* buffers,
+                // which belong exclusively to the full spectrogram view.
+                // This block owns its own canvas/ctx/imgBuf on `this`.
+                {
+                    const sgStripX = L.wfX + combMainW + 6;
+                    const sgStripW = combSpecW;
+                    const sgStripH = L.wfH;
+
+                    if (!analyserNode?.left) {
+                        if (!this._combSpecCanvas) {
+                            // Never played — show hint
+                            ctx.save();
+                            ctx.fillStyle = C.textDim;
+                            ctx.font = "italic 9px sans-serif";
+                            ctx.textAlign = "center";
+                            ctx.textBaseline = "middle";
+                            ctx.fillText("PLAY", sgStripX + sgStripW / 2, L.wfTop + sgStripH / 2);
+                            ctx.restore();
+                        } else {
+                            // Paused — blit frozen buffer
+                            ctx.save();
+                            ctx.beginPath();
+                            ctx.rect(sgStripX, L.wfTop, sgStripW, sgStripH);
+                            ctx.clip();
+                            ctx.drawImage(this._combSpecCanvas, sgStripX, L.wfTop);
+                            ctx.restore();
+                        }
+                    } else if (!playing) {
+                        // Paused but analyser ready — blit frozen buffer
+                        if (this._combSpecCanvas) {
+                            ctx.save();
+                            ctx.beginPath();
+                            ctx.rect(sgStripX, L.wfTop, sgStripW, sgStripH);
+                            ctx.clip();
+                            ctx.drawImage(this._combSpecCanvas, sgStripX, L.wfTop);
+                            ctx.restore();
+                        }
+                    } else {
+                        // Allocate or reallocate buffer when size changes
+                        if (!this._combSpecCanvas ||
+                            this._combSpecCanvas.width  !== sgStripW ||
+                            this._combSpecCanvas.height !== sgStripH) {
+                            this._combSpecCanvas = document.createElement("canvas");
+                            this._combSpecCanvas.width  = sgStripW;
+                            this._combSpecCanvas.height = sgStripH;
+                            this._combSpecCtx = this._combSpecCanvas.getContext("2d", { willReadFrequently: true });
+                            this._combSpecCtx.fillStyle = "#000";
+                            this._combSpecCtx.fillRect(0, 0, sgStripW, sgStripH);
+                            this._combSpecImgBuf = this._combSpecCtx.createImageData(1, sgStripH);
+                            this._combSpecFreqBuf = null; // will be allocated below
+                        }
+
+                        // Frequency data
+                        const binCount = analyserL.frequencyBinCount;
+                        if (!this._combSpecFreqBuf || this._combSpecFreqBuf.length !== binCount)
+                            this._combSpecFreqBuf = new Uint8Array(binCount);
+                        analyserL.getByteFrequencyData(this._combSpecFreqBuf);
+
+                        // Log-frequency mapping (same as drawSpectrogram)
+                        const usableBins = Math.floor(binCount * 0.75);
+                        const nyquist = (analyserL.context?.sampleRate ?? 44100) / 2;
+                        const hzPerBin = nyquist / binCount;
+                        const fMin = Math.max(20, hzPerBin);
+                        const fMax = usableBins * hzPerBin;
+                        const logFMin = Math.log2(fMin);
+                        const logFMax = Math.log2(fMax);
+                        const logRange = logFMax - logFMin;
+
+                        const px = this._combSpecImgBuf.data;
+                        for (let row = 0; row < sgStripH; row++) {
+                            const logFrac = 1 - (row / (sgStripH - 1));
+                            const hz  = Math.pow(2, logFMin + logFrac * logRange);
+                            const binF = hz / hzPerBin;
+                            const b0 = Math.floor(binF);
+                            const b1 = b0 + 1;
+                            const t  = binF - b0;
+                            let amp = b0 >= usableBins - 1
+                                ? this._combSpecFreqBuf[usableBins - 1]
+                                : this._combSpecFreqBuf[b0] * (1 - t) + this._combSpecFreqBuf[b1] * t;
+                            amp = Math.max(0, amp - 4);
+                            const vi   = Math.min(255, Math.round(amp)) * 3;
+                            const base = row * 4;
+                            px[base]     = SPEC_LUT[vi];
+                            px[base + 1] = SPEC_LUT[vi + 1];
+                            px[base + 2] = SPEC_LUT[vi + 2];
+                            px[base + 3] = 255;
+                        }
+
+                        // Shift rolling buffer left, append new column
+                        this._combSpecCtx.drawImage(this._combSpecCanvas, -1, 0);
+                        this._combSpecCtx.putImageData(this._combSpecImgBuf, sgStripW - 1, 0);
+
+                        // Blit to main canvas, clipped to strip rect
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.rect(sgStripX, L.wfTop, sgStripW, sgStripH);
+                        ctx.clip();
+                        ctx.drawImage(this._combSpecCanvas, sgStripX, L.wfTop);
+
+                        // Frequency tick overlays
+                        const freqTicks = [100, 500, 1000, 5000, 10000];
+                        ctx.font = "bold 8px sans-serif";
+                        ctx.textAlign = "right";
+                        ctx.textBaseline = "middle";
+                        for (const fTick of freqTicks) {
+                            if (fTick < fMin || fTick > fMax) continue;
+                            const logFrac = (Math.log2(fTick) - logFMin) / logRange;
+                            const ty = L.wfTop + sgStripH - logFrac * sgStripH;
+                            ctx.fillStyle = "rgba(255,255,255,0.18)";
+                            ctx.fillRect(sgStripX, Math.round(ty) - 0.5, sgStripW, 1);
+                            const label = fTick >= 1000 ? `${fTick/1000}k` : `${fTick}`;
+                            ctx.fillStyle = "rgba(255,255,255,0.5)";
+                            ctx.fillText(label, sgStripX + sgStripW - 3, ty);
+                        }
+                        ctx.restore();
+                    }
+
+                    // Vertical divider
+                    ctx.save();
+                    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(sgStripX - 3, L.wfTop + 4);
+                    ctx.lineTo(sgStripX - 3, L.wfBottom - 4);
+                    ctx.stroke();
+                    ctx.restore();
+                }
             }
 
             // ── Playhead (waveform mode only) ────────────────────────────────
@@ -1742,16 +2168,23 @@ function makeAudioPlayerWidget(node, data) {
             // to echo the played/unplayed colour split of the waveform bars.
             // Small filled circles at the top and bottom of the line ("anchor dots")
             // give it a polished physical marker appearance.
-            if (viewMode === "waveform" && progress > 0) {
-                const px = L.wfX + progress * L.totalW;
+            if ((viewMode === "waveform" || viewMode === "combined") && progress > 0) {
+                // In combined mode the waveform only spans combMainW (left of spectrogram)
+                const combMainWPh = viewMode === "combined" ? Math.round(L.totalW * 0.72) - 6 : L.totalW;
+                const px = L.wfX + progress * combMainWPh;
                 ctx.save();
 
                 // Glow colour matches the channel colour at that half of the file
                 const color = progress < 0.5 ? C.barPlayedLeft : C.barPlayedRight;
 
-                // 5 px inset from wfTop/wfBottom keeps the line clear of the
-                // channel-label text and the border of the waveform region.
                 const padding = 5;
+
+                // In combined mode the playhead only spans the waveform portion
+                // (top 55% of the area). In waveform mode it spans the full area.
+                const topLimit    = L.wfTop + padding;
+                const bottomLimit = viewMode === "combined"
+                    ? L.wfTop + Math.round(L.wfH * 0.55) - padding
+                    : L.wfBottom - padding;
 
                 ctx.shadowBlur = 12;
                 ctx.shadowColor = color;
@@ -1760,8 +2193,6 @@ function makeAudioPlayerWidget(node, data) {
                 ctx.globalAlpha = 1.0;
 
                 ctx.beginPath();
-                const topLimit = L.wfTop + padding;
-                const bottomLimit = L.wfBottom - padding;
                 ctx.moveTo(px, topLimit);
                 ctx.lineTo(px, bottomLimit);
                 ctx.stroke();
@@ -1784,32 +2215,41 @@ function makeAudioPlayerWidget(node, data) {
             // detected clip so momentary peaks are visible even if the user
             // looks away. Drawn in the right margin, vertically centred between
             // the two channels (or at the single-channel midpoint for mono).
-            if (this._showClip) {
-                const ledSize = 8;
-                const ledX = w - PAD_X - ledSize;
-                const ledY = L.stereo
-                     ? (L.ch0MidY + L.ch1MidY) / 2 - ledSize / 2
-                     : L.midY - ledSize / 2;
+            // Evaluate clip LED hold timer every frame (outside rate-limit block)
+            // so the 1 s timeout actually expires between analyser updates.
+            this._showClip = (performance.now() - this._clipHold) < 1000;
 
+            if (this._showClip) {
                 ctx.save();
+                // Single unified clip indicator: "CLIP" text with LED dot to its left
+                ctx.font = "bold 9px sans-serif";
+                ctx.textAlign = "right";
+                ctx.textBaseline = "middle";
+                const clipCY = L.stereo
+                     ? (L.ch0MidY + L.ch1MidY) / 2
+                     : L.midY;
+                const clipX = w - PAD_X;
+                const dotR = 4;
+                const textX = clipX - dotR * 2 - 3;
+                // Glow effect
                 ctx.shadowColor = "#ff3b3b";
                 ctx.shadowBlur = 8;
+                // LED dot
                 ctx.fillStyle = "#ff3b3b";
-                rr(ctx, ledX, ledY, ledSize, ledSize, 2);
+                ctx.beginPath();
+                ctx.arc(clipX - dotR, clipCY, dotR, 0, Math.PI * 2);
                 ctx.fill();
-                // Specular highlight dot to simulate a physical LED lens
+                // Specular highlight
                 ctx.shadowBlur = 0;
                 ctx.fillStyle = "rgba(255,180,180,0.7)";
                 ctx.beginPath();
-                ctx.arc(ledX + ledSize * 0.35, ledY + ledSize * 0.35, ledSize * 0.18, 0, Math.PI * 2);
+                ctx.arc(clipX - dotR - dotR * 0.2, clipCY - dotR * 0.25, dotR * 0.35, 0, Math.PI * 2);
                 ctx.fill();
-                // "CLIP" micro-label directly beneath the LED
-                ctx.shadowBlur = 0;
+                // CLIP label
+                ctx.shadowBlur = 6;
+                ctx.shadowColor = "#ff3b3b";
                 ctx.fillStyle = "#ff3b3b";
-                ctx.font = "bold 8px sans-serif";
-                ctx.textAlign = "center";
-                ctx.textBaseline = "top";
-                ctx.fillText("CLIP", ledX + ledSize / 2, ledY + ledSize + 2);
+                ctx.fillText("CLIP", textX, clipCY);
                 ctx.restore();
             }
 
@@ -1853,36 +2293,29 @@ function makeAudioPlayerWidget(node, data) {
                     // Allocate (or reuse) Uint8Array buffers sized to the analyser's
                     // fftSize. Reallocated only if the fftSize ever changes.
                     if (!_timeDomainL || _timeDomainL.length !== analyserL.fftSize) {
-                        _timeDomainL = new Uint8Array(analyserL.fftSize);
-                        _timeDomainR = new Uint8Array(analyserR.fftSize);
+                        _timeDomainL = new Float32Array(analyserL.fftSize);
+                        _timeDomainR = new Float32Array(analyserR.fftSize);
                     }
 
-                    // Time-domain data is always needed for the level meter and clip
-                    // detection. The goniometer also uses it in analyzer mode.
-                    // Always fetch so all view modes show consistent meter readings.
-                    analyserL.getByteTimeDomainData(_timeDomainL);
-                    analyserR.getByteTimeDomainData(_timeDomainR);
+                    analyserL.getFloatTimeDomainData(_timeDomainL);
+                    analyserR.getFloatTimeDomainData(_timeDomainR);
                     const bufferL = _timeDomainL;
                     const bufferR = _timeDomainR;
 
                     // ── Clip detection ────────────────────────────────────────
-                    // A sample is considered clipped if its unsigned byte value
-                    // reaches the ceiling (254–255) or floor (0–1), which
-                    // corresponds to ±1.0 in normalised float terms.
-                    // The analyser taps the signal BEFORE the gainNode, so it
-                    // always sees the raw unscaled audio regardless of volume.
-                    // No compensation factor is needed or correct here — applying
-                    // one would amplify samples at low volume and cause false clips.
+                    // getFloatTimeDomainData returns exact [-1.0, +1.0] samples,
+                    // so a true clip is simply any sample whose absolute value
+                    // reaches or exceeds 1.0. No quantisation ambiguity.
                     let isClippingNow = false;
                     if (bufferL && bufferR) {
                         for (let i = 0; i < bufferL.length; i++) {
-                            if (bufferL[i] <= 1 || bufferL[i] >= 254) {
+                            if (bufferL[i] >= CLIP_THRESHOLD || bufferL[i] <= -CLIP_THRESHOLD) {
                                 isClippingNow = true;
                                 break;
                             }
                         }
                         for (let i = 0; i < bufferR.length && !isClippingNow; i++) {
-                            if (bufferR[i] <= 1 || bufferR[i] >= 254) {
+                            if (bufferR[i] >= CLIP_THRESHOLD || bufferR[i] <= -CLIP_THRESHOLD) {
                                 isClippingNow = true;
                                 break;
                             }
@@ -1897,20 +2330,18 @@ function makeAudioPlayerWidget(node, data) {
                     if (isClippingNow) {
                         this._clipHold = performance.now();
                     }
-                    // LED stays lit for 1 s after the last clipping sample
-                    this._showClip = (performance.now() - this._clipHold) < 1000;
+                    // _showClip is evaluated outside this rate-limit block
+                    // so the 1 s hold timer expires correctly every frame.
 
                     // ── RMS helper ────────────────────────────────────────────
-                    // Computes root-mean-square amplitude from a time-domain
-                    // Uint8Array. Each byte is normalised from [0, 255] to [−1, +1]
-                    // by the transform v = (byte / 128) − 1, then squared and averaged.
+                    // Computes root-mean-square amplitude from a Float32Array
+                    // where samples are already in the range [-1, +1].
                     const getRMS = (buf) => {
                         if (!buf)
                             return 0;
                         let sum = 0;
                         for (let i = 0; i < buf.length; i++) {
-                            const v = (buf[i] / 128) - 1; // centre on 0 and normalise
-                            sum += v * v;
+                            sum += buf[i] * buf[i];
                         }
                         return Math.sqrt(sum / buf.length);
                     };
@@ -2297,8 +2728,9 @@ function makeAudioPlayerWidget(node, data) {
             const viewLabel = viewMode === "waveform" ? "WAVEFORM"
                  : viewMode === "eq" ? "SPECTRUM"
                  : viewMode === "analyzer" ? "ANALYZER"
-                 : "SPECTROGRAM";
-            const vBtnW = viewMode === "spectrogram" ? 90 : 74,
+                 : viewMode === "spectrogram" ? "SPECTROGRAM"
+                 : "COMBINED";
+            const vBtnW = (viewMode === "spectrogram" || viewMode === "combined") ? 90 : 74,
             vBtnH = 16;
 
             // Mode-specific background colour
@@ -2311,6 +2743,9 @@ function makeAudioPlayerWidget(node, data) {
                 break;
             case "spectrogram":
                 ctx.fillStyle = "#4B0082"; // deep purple
+                break;
+            case "combined":
+                ctx.fillStyle = "#1a4a3a"; // dark teal-green
                 break;
             default: // analyzer
                 ctx.fillStyle = "#017DA2"; // teal
@@ -2381,7 +2816,7 @@ function makeAudioPlayerWidget(node, data) {
                     break;
                 case "view": {
                         // vBtnWh must match the width used when drawing the button above
-                        const vBtnWh = viewMode === "spectrogram" ? 90 : 74;
+                        const vBtnWh = (viewMode === "spectrogram" || viewMode === "combined") ? 90 : 74;
                         glowRect(L.eqBtnX - vBtnWh / 2, L.btnCY - vBtnH / 2, vBtnWh, vBtnH, 4);
                         break;
                     }
@@ -2530,7 +2965,7 @@ function makeAudioPlayerWidget(node, data) {
                 // Persist full state — keep current volume/muted alongside new viewMode
                 widget.value = { viewMode, volume, muted };
 
-                if (viewMode === "eq" || viewMode === "analyzer") {
+                if (viewMode === "eq" || viewMode === "analyzer" || viewMode === "combined") {
                     ensureAnalyser();
                     connectAnalyser();
                 } else {
@@ -2705,13 +3140,25 @@ function makeAudioPlayerWidget(node, data) {
         onRemoved() {
             audioEl.pause();
             audioEl.src = ""; // release the audio element
+            _audioRegistry.delete(filename); // clean up registry entry
             document.getElementById("ap-dl-menu")?.remove();
             // Free offscreen canvas memory
             _waveformCache = null;
             _specCanvas = null;
+            this._combSpecCanvas = null;
+            this._combSpecCtx = null;
+            this._combSpecFreqBuf = null;
+            this._combSpecImgBuf = null;
+            this._combWfCache = null;
             _specCtx = null;
             _specFreqBuf = null;
             _specImgBuf = null;
+            // Free frozen-frame snapshots
+            this._freqDataFrozen = null;
+            this._gonFrozenL = null;
+            this._gonFrozenR = null;
+            this._combGonFrozenL = null;
+            this._combGonFrozenR = null;
             if (rafId) {
                 cancelAnimationFrame(rafId);
                 rafId = null;
@@ -2841,6 +3288,52 @@ app.registerExtension({
             return _onResize?.apply(this, arguments);
         };
 
+        // ── Tab-switch / workflow-reload restore ─────────────────────────────
+        // When the user switches ComfyUI tabs and back, LiteGraph calls
+        // onConfigure() to reconstruct the node from its saved JSON.
+        // onExecuted() is NOT re-fired — so without this hook the widget
+        // disappears.  We re-fetch the peaks (served from the sidecar JSON
+        // on disk, so this also works after a server restart as long as the
+        // temp WAV is still present) and rebuild the widget exactly as
+        // onExecuted does.
+        const _onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            _onConfigure?.call(this, info);
+
+            const saved = this.properties?.lastAudioData;
+            if (!saved?.filename) return;
+
+            const self = this;
+            fetch(`/audio_player/peaks/${saved.filename}`)
+                .then(r => {
+                    if (!r.ok) throw new Error("peaks not found");
+                    return r.json();
+                })
+                .then(peaks => {
+                    const data = { ...saved, peaks };
+
+                    if (!self.widgets) self.widgets = [];
+                    const idx = self.widgets.findIndex(w => w.name === WIDGET_NAME);
+                    const prevValue = idx >= 0 ? self.widgets[idx].value : null;
+                    if (idx >= 0) {
+                        self.widgets[idx].onRemoved?.();
+                        self.widgets.splice(idx, 1);
+                    }
+
+                    const newWidget = makeAudioPlayerWidget(self, data);
+                    if (prevValue) newWidget.value = prevValue;
+                    self.widgets.push(newWidget);
+
+                    if (!self.properties) self.properties = {};
+                    if (self.properties.audioPlayerSize) {
+                        self.setSize(self.properties.audioPlayerSize);
+                    }
+
+                    self.setDirtyCanvas(true, true);
+                })
+                .catch(e => console.warn("[AudioPlayer] onConfigure restore skipped:", e.message));
+        };
+
         const _onExecuted = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (message) {
             _onExecuted?.apply(this, arguments);
@@ -2851,6 +3344,16 @@ app.registerExtension({
 
             const data = payloads[0];
             const self = this;
+
+            // Persist payload so onConfigure can restore after a tab switch
+            if (!self.properties) self.properties = {};
+            self.properties.lastAudioData = {
+                filename:    data.filename,
+                duration:    data.duration,
+                sample_rate: data.sample_rate,
+                stereo:      data.stereo,
+                lufs:        data.lufs,
+            };
 
             fetch(`/audio_player/peaks/${data.filename}`)
             .then(r => r.json())
