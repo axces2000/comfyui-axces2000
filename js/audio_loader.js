@@ -1,5 +1,17 @@
 /**
- * AudioLoader Widget for ComfyUI  v2.6
+ * AudioLoader Widget for ComfyUI  v2.9
+ *
+ * v2.9 — pitch_shift_semitones (an auto-generated FLOAT widget) could reach
+ * the backend as `null` in some ComfyUI frontend builds, which crashes
+ * ComfyUI's own prompt validator (float(None)) before the node ever runs.
+ * Fixed by giving that widget a serializeValue() that always emits a real
+ * finite number. See the comment at its creation site below for details.
+ *
+ * v2.8 — The server's /upload/audio route now dedups by content checksum:
+ * re-uploading a file that's byte-identical to one already sitting under
+ * the same name (or same-name_N) reuses that existing file instead of
+ * writing a new numbered duplicate. Purely server-side; the only JS change
+ * is logging data.deduped to the console for visibility.
  *
  * trim_json is declared as a hidden input in Python's INPUT_TYPES.
  * ComfyUI passes hidden inputs automatically in the prompt — but only if
@@ -8,6 +20,17 @@
  * We use the cleanest available hook: override the node's getExtraInfo()
  * which ComfyUI calls when building the prompt, injecting trim_json there.
  * Fallback: also set it via a beforeQueued hook on the audio combo widget.
+ *
+ * v2.7 — Added `pitch_shift_semitones`, a plain optional FLOAT input on the
+ * Python side. ComfyUI auto-generates its widget from INPUT_TYPES just like
+ * `normalize`, so it needs no special handling here. The one thing that
+ * *does* need care: adding a new auto-widget shifts every widget's position
+ * in node.widgets / widgets_values. The old trim-restore code below read
+ * widgets_values by a hardcoded index (vals[3]), which would silently break
+ * as soon as any new widget was added anywhere before it. It now reads the
+ * trim_json widget's own `.value` instead — LiteGraph already restores each
+ * widget's value from widgets_values (by position) before onConfigure runs,
+ * so this is correct and immune to future widget-order changes.
  */
 
 import { app } from "../../../scripts/app.js";
@@ -164,6 +187,9 @@ function createAudioWidget(node, nativeComboWidget) {
       const res=await api.fetchApi("/upload/audio",{method:"POST",body:fd});
       if (!res.ok) throw new Error(await res.text());
       const data=await res.json();
+      if (data.deduped) {
+        console.log(`[AudioLoader] "${file.name}" is byte-identical to existing "${data.name}" — reusing it instead of uploading a duplicate.`);
+      }
       await loadAudioFile(data.name);
     } catch(e) { console.error("[AudioLoader] upload error",e); alert("Upload failed: "+e.message); }
   }
@@ -344,6 +370,29 @@ app.registerExtension({
       onNodeCreated?.apply(this, arguments);
       this.serialize_widgets = true;
 
+      // pitch_shift_semitones is a plain auto-generated FLOAT widget (it's
+      // just declared as an optional input in Python's INPUT_TYPES — no
+      // custom widget code needed for it). In some ComfyUI frontend builds
+      // a freshly-created optional numeric widget can end up with a null
+      // value instead of the declared default, and ComfyUI's own backend
+      // validator does an unconditional `float(value)` on any input whose
+      // key is present in the prompt — float(None) raises, which surfaces
+      // to the user as "failed to validate prompt" before the node ever
+      // runs (our own Python-side None-guards never get a chance to help,
+      // since that crash happens in ComfyUI's core, upstream of our code).
+      // Widgets are serialised via widget.serializeValue() when present,
+      // so pinning one down here guarantees a real number is always sent,
+      // regardless of what the widget's raw .value happens to be.
+      const pitchW = this.widgets?.find(w => w.name === "pitch_shift_semitones");
+      if (pitchW) {
+        const safeNumber = (v) => {
+          const n = Number(v);
+          return Number.isFinite(n) ? n : 0;
+        };
+        if (!Number.isFinite(Number(pitchW.value))) pitchW.value = 0;
+        pitchW.serializeValue = () => safeNumber(pitchW.value);
+      }
+
       const comboW = this.widgets?.find(w => w.name === "audio");
       if (!comboW) { console.error("[AudioLoader] combo widget not found"); return; }
 
@@ -394,11 +443,16 @@ app.registerExtension({
       const vals  = config.widgets_values ?? [];
       const fname = safeStr(vals[0]);
 
-      // Restore trim: prefer the serialised trim_json widget (vals[3]),
-      // fall back to the legacy axces2000_trim property for old workflows.
+      // Restore trim: LiteGraph already restores each widget's `.value`
+      // from widgets_values (matched by array position) before onConfigure
+      // runs, so we read the trim_json widget's own current value directly
+      // instead of indexing into widgets_values ourselves. This keeps trim
+      // restore correct no matter how many other widgets (e.g. the
+      // pitch_shift_semitones auto-widget) get added before it.
+      // Falls back to the legacy axces2000_trim property for old workflows.
       let ts=0, te=0;
       try {
-        const savedTrim = vals[3] ?? null;
+        const savedTrim = this._alTrimWidget?.value ?? null;
         if (savedTrim && savedTrim !== '{"s":0,"e":0}') {
           const p = JSON.parse(savedTrim);
           ts = p.s ?? 0; te = p.e ?? 0;
