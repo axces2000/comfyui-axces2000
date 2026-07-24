@@ -59,11 +59,18 @@ class AudioLoaderNode:
     OUTPUT_NODE  = False
 
     def _load_waveform(self, audio_path):
+        # NOTE: torchcodec is intentionally never imported here. On some
+        # Windows/embedded-python setups, importing torchcodec triggers a
+        # native DLL load (libtorchcodec_core*.dll) that can hard-crash the
+        # process with an "Entry Point Not Found" error *before* Python's
+        # try/except has a chance to catch anything - so wrapping the import
+        # in try/except does not protect against it. soundfile and
+        # torchaudio are pure-Python-safe fallbacks and are tried first.
         last_error = None
         try:
-            from torchcodec.decoders import AudioDecoder
-            dec = AudioDecoder(audio_path); s = dec.get_all_samples()
-            return s.data, s.sample_rate
+            import soundfile as sf, torch
+            data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+            return torch.from_numpy(data.T), sr
         except Exception as e: last_error = e
         try:
             import torchaudio
@@ -76,11 +83,6 @@ class AudioLoaderNode:
         try:
             import torchaudio
             return torchaudio.load(audio_path)
-        except Exception as e: last_error = e
-        try:
-            import soundfile as sf, torch
-            data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
-            return torch.from_numpy(data.T), sr
         except Exception as e: last_error = e
         raise RuntimeError(f"Could not load audio. Last error: {last_error}")
 
