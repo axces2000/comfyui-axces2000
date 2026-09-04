@@ -3,11 +3,13 @@ comfyui-axces2000
 Custom ComfyUI nodes by axces2000.
 
 Nodes:
-  - AudioLoader       (🎵 Audio Loader)
-  - ResolutionMaster  (📐 Resolution Master)
-  - StringExtractor   (✂️ String Extractor)
-  - StringCombine     (🔗 String Combine)
-  - AudioPlayerNode   (Audio Player 🎵)
+  - AudioLoader                 (🎵 Audio Loader)
+  - AudioPlayerNode             (🎵 Audio Player)
+  - ArtifactFrequencyAnalyzer   (🎵 Artifact Frequency Analyzer)
+  - ArtifactCleaner             (🎵 Artifact Cleaner)
+  - ResolutionMaster            (📐 Resolution Master)
+  - StringExtractor             (✂️ String Extractor)
+  - StringCombine               (🔗 String Combine)
 """
 
 from .audio_loader.audio_loader import (
@@ -31,12 +33,25 @@ from .audio_player.audio_player_node import (
     NODE_DISPLAY_NAME_MAPPINGS as AUDIO_PLAYER_NAMES,
 )
 
+from .audio_artifact_cleaner.artifact_analyzer import (
+    NODE_CLASS_MAPPINGS as _ANALYZER_NODES,
+    NODE_DISPLAY_NAME_MAPPINGS as _ANALYZER_NAMES,
+)
+from .audio_artifact_cleaner.artifact_cleaner import (
+    NODE_CLASS_MAPPINGS as _CLEANER_NODES,
+    NODE_DISPLAY_NAME_MAPPINGS as _CLEANER_NAMES,
+)
+
+
+
 NODE_CLASS_MAPPINGS = {
     **AUDIO_LOADER_MAPPINGS,
     **RESOLUTION_MAPPINGS,
     **EXTRACTOR_MAPPINGS,
     **COMBINE_MAPPINGS,
     **AUDIO_PLAYER_MAPPINGS,
+    **_ANALYZER_NODES, 
+    **_CLEANER_NODES,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -45,6 +60,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **EXTRACTOR_NAMES,
     **COMBINE_NAMES,
     **AUDIO_PLAYER_NAMES,
+    **_ANALYZER_NAMES, 
+    **_CLEANER_NAMES,
 }
 
 WEB_DIRECTORY = "./js"
