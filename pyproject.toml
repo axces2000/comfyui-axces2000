@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-axces2000"
-description = "Custom ComfyUI nodes by axces2000 — Audio Loader, Audio Player, Artifact Analyzer and Cleaner, Resolution Master, and more"
+description = "Custom ComfyUI nodes by axces2000 — Audio Loader, Audio Player, Artifact Analyzer and Cleaner, Audio Metadata, Resolution Master, and more"
 version = "1.3.0"
 license = {file = "LICENSE"} 
 # classifiers = [
