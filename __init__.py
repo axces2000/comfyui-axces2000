@@ -5,6 +5,7 @@ Custom ComfyUI nodes by axces2000.
 Nodes:
   - AudioLoader                 (🎵 Audio Loader)
   - AudioPlayerNode             (🎵 Audio Player)
+  - AudioMetadataNode           (🎵 Audio Metadata)
   - ArtifactFrequencyAnalyzer   (🎵 Artifact Frequency Analyzer)
   - ArtifactCleaner             (🎵 Artifact Cleaner)
   - ResolutionMaster            (📐 Resolution Master)
@@ -42,6 +43,11 @@ from .audio_artifact_cleaner.artifact_cleaner import (
     NODE_DISPLAY_NAME_MAPPINGS as _CLEANER_NAMES,
 )
 
+from .audio_metadata.audio_metadata_node import (
+    NODE_CLASS_MAPPINGS as _METADATA_NODES,
+    NODE_DISPLAY_NAME_MAPPINGS as _METADATA_NAMES,
+)
+
 
 
 NODE_CLASS_MAPPINGS = {
@@ -52,6 +58,7 @@ NODE_CLASS_MAPPINGS = {
     **AUDIO_PLAYER_MAPPINGS,
     **_ANALYZER_NODES, 
     **_CLEANER_NODES,
+    **_METADATA_NODES,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -62,6 +69,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **AUDIO_PLAYER_NAMES,
     **_ANALYZER_NAMES, 
     **_CLEANER_NAMES,
+    **_METADATA_NAMES,
 }
 
 WEB_DIRECTORY = "./js"
