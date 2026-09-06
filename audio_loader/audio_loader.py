@@ -218,7 +218,7 @@ from aiohttp import web
 
 def _hash_file(path, chunk_size=1 << 20):
     """MD5 checksum of a file's contents, read in chunks to bound memory."""
-    h = hashlib.md5()
+    h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
             chunk = f.read(chunk_size)
@@ -252,9 +252,20 @@ def _name_family(input_dir, filename):
 # decide there's no match and race to create two separate numbered copies.
 _upload_lock = asyncio.Lock()
 
+def _require_local(request):
+    """Reject requests that didn't originate from this machine (loopback),
+    so these endpoints can't be driven by other hosts on the network."""
+    if request.remote not in ("127.0.0.1", "::1"):
+        return web.Response(status=403, text="Forbidden: local requests only")
+    return None
+
+
 @PromptServer.instance.routes.post("/axces2000/audio_trim")
 async def set_audio_trim(request):
     """JS posts trim JSON here; we echo it back so the prompt can include it."""
+    forbidden = _require_local(request)
+    if forbidden:
+        return forbidden
     try:
         data = await request.json()
         return web.json_response({"ok": True, "trim_json": json.dumps({
@@ -267,6 +278,9 @@ async def set_audio_trim(request):
 
 @PromptServer.instance.routes.post("/upload/audio")
 async def upload_audio(request):
+    forbidden = _require_local(request)
+    if forbidden:
+        return forbidden
     reader = await request.multipart()
     field  = await reader.next()
     if not field or field.name != "image":
@@ -288,7 +302,7 @@ async def upload_audio(request):
         prefix=".axces2000_upload_", suffix=ext_with_dot, dir=input_dir
     )
     try:
-        hasher = hashlib.md5()
+        hasher = hashlib.sha256()
         with os.fdopen(tmp_fd, "wb") as f:
             while chunk := await field.read_chunk(8192):
                 f.write(chunk)
