@@ -16,11 +16,14 @@ def _save_wav(waveform, sample_rate: int, filepath: str):
     n_frames  = waveform.shape[-1]
     data_size = n_frames * n_ch * 2
     with open(filepath, 'wb') as f:
-        f.write(b"RIFF"); f.write(struct.pack("<I", 36 + data_size))
-        f.write(b"WAVE"); f.write(b"fmt ")
+        f.write(b"RIFF"); 
+        f.write(struct.pack("<I", 36 + data_size))
+        f.write(b"WAVE"); 
+        f.write(b"fmt ")
         f.write(struct.pack("<IHHIIHH", 16, 1, n_ch, sample_rate,
                             sample_rate*n_ch*2, n_ch*2, 16))
-        f.write(b"data"); f.write(struct.pack("<I", data_size))
+        f.write(b"data"); 
+        f.write(struct.pack("<I", data_size))
         f.write(pcm.tobytes())
 
 
